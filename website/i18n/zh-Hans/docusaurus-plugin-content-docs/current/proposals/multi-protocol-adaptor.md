@@ -2,7 +2,7 @@
 translation:
   source_commit: "15da5536"
   source_file: "docs/proposals/multi-protocol-adaptor.md"
-  outdated: false
+  outdated: true
 ---
 
 # 设计文档：多协议适配器架构
