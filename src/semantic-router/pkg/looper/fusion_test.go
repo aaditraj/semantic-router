@@ -585,10 +585,160 @@ func TestFusionAnalysisPromptRequestsCompactJSON(t *testing.T) {
 	})
 
 	assert.Contains(t, prompt, "return only valid JSON")
-	assert.Contains(t, prompt, "Return compact JSON only")
-	assert.Contains(t, prompt, "no markdown")
-	assert.Contains(t, prompt, "no code fences")
+	assert.Contains(t, prompt, "Do not call tools")
+	assert.Contains(t, prompt, "Exact expected JSON structure")
+	assert.Contains(t, prompt, "```json")
 	assert.Contains(t, prompt, "at most two concise strings")
+}
+
+func TestNormalizePanelResponseForAnalysisRewritesLegacyToolCallMarkup(t *testing.T) {
+	normalized := normalizePanelResponseForAnalysis("<tool_call>bash<arg_key>command</arg_key><arg_value>cd /testbed && git diff</arg_value></tool_call>")
+
+	assert.Contains(t, normalized, "Proposed tool call: bash")
+	assert.Contains(t, normalized, `command="cd /testbed && git diff"`)
+	assert.NotContains(t, normalized, "<tool_call>")
+}
+
+func TestNormalizePanelResponseForAnalysisPreservesPreambleBeforeToolCall(t *testing.T) {
+	normalized := normalizePanelResponseForAnalysis("Let me look at the failing tests first. <tool_call>read<arg_key>filePath</arg_key><arg_value>/testbed/astropy/tests/test_quantity.py</arg_value></tool_call>")
+
+	assert.Contains(t, normalized, "Let me look at the failing tests first.")
+	assert.Contains(t, normalized, "Proposed tool call: read")
+	assert.Contains(t, normalized, `filePath="/testbed/astropy/tests/test_quantity.py"`)
+	assert.NotContains(t, normalized, "<tool_call>")
+}
+
+// The analysis stage must EXTEND the conversation, never rewrite it: rewriting
+// diverges from the token prefix the panel and synthesis calls share, which
+// costs a full re-prefill on every turn.
+func TestBuildFusionAnalysisStageRequestExtendsHistoryWithoutRewritingIt(t *testing.T) {
+	params := openai.ChatCompletionNewParams{
+		Model: "vllm-sr/fusion",
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			openai.UserMessage("u1"),
+			openai.AssistantMessage("a1"),
+			openai.UserMessage("u2"),
+			openai.AssistantMessage("a2"),
+			openai.UserMessage("u3"),
+		},
+	}
+
+	prepared := buildFusionAnalysisStageRequest(&params, "analysis prompt")
+	require.NotNil(t, prepared)
+
+	raw, err := json.Marshal(prepared)
+	require.NoError(t, err)
+	var payload map[string]interface{}
+	require.NoError(t, json.Unmarshal(raw, &payload))
+
+	msgs, ok := payload["messages"].([]interface{})
+	require.True(t, ok)
+	require.Len(t, msgs, 7)
+
+	var roles []string
+	var contents []string
+	for _, m := range msgs {
+		msg := m.(map[string]interface{})
+		roles = append(roles, msg["role"].(string))
+		if c, ok := msg["content"].(string); ok {
+			contents = append(contents, c)
+		}
+	}
+	assert.Equal(t, []string{"user", "assistant", "user", "assistant", "user", "system", "user"}, roles)
+	assert.Equal(
+		t,
+		[]string{"u1", "a1", "u2", "a2", "u3", fusionAnalysisStageSystemPrompt, "analysis prompt"},
+		contents,
+	)
+}
+
+func TestStripUnterminatedToolCall(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no tool call", "plain text", "plain text"},
+		{
+			"complete call is preserved",
+			"<tool_call>bash ls</tool_call>",
+			"<tool_call>bash ls</tool_call>",
+		},
+		{
+			"trailing fragment is dropped",
+			"looking at the file\n<tool_call>bash grep -rn \"endswith\" /testbed/dj",
+			"looking at the file",
+		},
+		{
+			// The panel closes with </think> instead of </tool_call>, so neither
+			// call is terminated and everything from the first one goes.
+			"think-closed calls are dropped whole",
+			"<tool_call>bash head -100 x.py</think><tool_call>bash grep foo",
+			"",
+		},
+		{
+			"complete call kept, following fragment dropped",
+			"<tool_call>bash ls</tool_call>\nnow let me look\n<tool_call>bash cat",
+			"<tool_call>bash ls</tool_call>\nnow let me look",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, stripUnterminatedToolCall(tc.in))
+		})
+	}
+}
+
+func TestFormatPanelResponsesDropsTruncatedToolCalls(t *testing.T) {
+	responses := []*ModelResponse{
+		{Model: "laguna", Content: "<tool_call>bash grep -rn \"endswith\" /testbed/dj"},
+		{Model: "laguna-2", Content: "the fix belongs in compiler.py", ReasoningContent: "checking\n<tool_call>bash cat"},
+	}
+
+	out := formatPanelResponses(responses)
+
+	assert.NotContains(t, out, "<tool_call>", "truncated fragments must not reach the synthesis prompt")
+	assert.Contains(t, out, truncatedPanelNotice, "a panel left with nothing must say it was cut off")
+	assert.Contains(t, out, "the fix belongs in compiler.py")
+	assert.Contains(t, out, "checking")
+}
+
+func TestNormalizePanelResponseForAnalysisHandlesTruncation(t *testing.T) {
+	assert.Equal(t, truncatedPanelNotice,
+		normalizePanelResponseForAnalysis("<tool_call>bash grep -rn \"endswith\" /testbed/dj"))
+	assert.Equal(t, "", normalizePanelResponseForAnalysis("   "))
+	assert.Equal(t, "just prose", normalizePanelResponseForAnalysis("just prose"))
+}
+
+func TestAppendFusionStageMessageDoesNotInjectAnalysisSystemPrompt(t *testing.T) {
+	params := openai.ChatCompletionNewParams{
+		Model: "vllm-sr/fusion",
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			openai.SystemMessage("base system"),
+			openai.UserMessage("u1"),
+		},
+	}
+
+	appended := appendFusionStageMessage(&params, "final prompt")
+	require.NotNil(t, appended)
+
+	raw, err := json.Marshal(appended)
+	require.NoError(t, err)
+	var payload map[string]interface{}
+	require.NoError(t, json.Unmarshal(raw, &payload))
+
+	msgs, ok := payload["messages"].([]interface{})
+	require.True(t, ok)
+	require.Len(t, msgs, 3)
+	last := msgs[len(msgs)-1].(map[string]interface{})
+	assert.Equal(t, "user", last["role"])
+	assert.Equal(t, "final prompt", last["content"])
+
+	for _, m := range msgs {
+		msg := m.(map[string]interface{})
+		content, _ := msg["content"].(string)
+		assert.NotEqual(t, fusionAnalysisStageSystemPrompt, content)
+	}
 }
 
 func TestFusionFinalPromptIncludesSystemOutputContract(t *testing.T) {
@@ -610,6 +760,14 @@ func TestParseFusionAnalysisAcceptsFencedJSON(t *testing.T) {
 	require.NotNil(t, analysis)
 	assert.Equal(t, []string{"agree"}, analysis.Consensus)
 	assert.False(t, analysis.ParseFailed)
+}
+
+func TestParseFusionAnalysisAcceptsInlineFencedJSON(t *testing.T) {
+	analysis, err := parseFusionAnalysis("```json {\"consensus\":[\"agree\"],\"contradictions\":[],\"partial_coverage\":[],\"unique_insights\":[],\"blind_spots\":[]} ```")
+
+	require.NoError(t, err)
+	require.NotNil(t, analysis)
+	assert.Equal(t, []string{"agree"}, analysis.Consensus)
 }
 
 func TestParseFusionAnalysisExtractsJSONFromReasoningText(t *testing.T) {
@@ -634,6 +792,71 @@ func TestParseFusionAnalysisRepairsInvalidStringEscapes(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, analysis)
 	assert.Equal(t, []string{`same \(escaped\) text`}, analysis.Consensus)
+}
+
+func TestParseFusionAnalysisRepairsUnclosedJSONObject(t *testing.T) {
+	analysis, err := parseFusionAnalysis(`{"consensus":["fix signature"],"contradictions":[],"partial_coverage":[],"unique_insights":[],"blind_spots":[]`)
+
+	require.NoError(t, err)
+	require.NotNil(t, analysis)
+	assert.Equal(t, []string{"fix signature"}, analysis.Consensus)
+}
+
+func TestParseFusionAnalysisStripsThinkTagPrefix(t *testing.T) {
+	analysis, err := parseFusionAnalysis("<think>deliberation</think>\n{\"consensus\":[\"agree\"],\"contradictions\":[],\"partial_coverage\":[],\"unique_insights\":[],\"blind_spots\":[]}")
+
+	require.NoError(t, err)
+	require.NotNil(t, analysis)
+	assert.Equal(t, []string{"agree"}, analysis.Consensus)
+}
+
+func TestParseFusionAnalysisKeepsJSONBeforeThinkAndToolCallTail(t *testing.T) {
+	analysis, err := parseFusionAnalysis("{\"consensus\":[\"simplify signature\"],\"contradictions\":[],\"partial_coverage\":[],\"unique_insights\":[],\"blind_spots\":[]}</think><tool_call>bash<arg_key>command</arg_key><arg_value>cd /testbed && git diff HEAD</arg_value></tool_call>")
+
+	require.NoError(t, err)
+	require.NotNil(t, analysis)
+	assert.Equal(t, []string{"simplify signature"}, analysis.Consensus)
+}
+
+func TestParseFusionAnalysisKeepsJSONBeforeActionBlockTail(t *testing.T) {
+	analysis, err := parseFusionAnalysis("{\"consensus\":[\"fix target file\"],\"contradictions\":[],\"partial_coverage\":[],\"unique_insights\":[],\"blind_spots\":[]}<|START_ACTION|>[{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}]<|END_ACTION|>")
+
+	require.NoError(t, err)
+	require.NotNil(t, analysis)
+	assert.Equal(t, []string{"fix target file"}, analysis.Consensus)
+}
+
+func TestParseFusionAnalysisFlattensNestedArrays(t *testing.T) {
+	analysis, err := parseFusionAnalysis(`{"consensus":[["a","b"]],"contradictions":[],"partial_coverage":[["c"]],"unique_insights":[],"blind_spots":[]}`)
+
+	require.NoError(t, err)
+	require.NotNil(t, analysis)
+	assert.Equal(t, []string{"a", "b"}, analysis.Consensus)
+	assert.Equal(t, []string{"c"}, analysis.PartialCoverage)
+}
+
+func TestParseFusionAnalysisAcceptsSingleStringValue(t *testing.T) {
+	analysis, err := parseFusionAnalysis(`{"consensus":"Both models agree on the fix in astropy/html.py"}`)
+
+	require.NoError(t, err)
+	require.NotNil(t, analysis)
+	assert.Equal(t, []string{"Both models agree on the fix in astropy/html.py"}, analysis.Consensus)
+}
+
+func TestParseFusionAnalysisRejectsPayloadWithNoFusionKeys(t *testing.T) {
+	analysis, err := parseFusionAnalysis(`{"summary":"looks good","score":0.9}`)
+
+	require.Error(t, err)
+	assert.Nil(t, analysis)
+	assert.Contains(t, err.Error(), "contains no Fusion analysis keys")
+}
+
+func TestParseFusionAnalysisSkipsNonFusionJSONObjectAndParsesNext(t *testing.T) {
+	analysis, err := parseFusionAnalysis(`preface {"summary":"scratch"} suffix {"consensus":"agree","contradictions":[],"partial_coverage":[],"unique_insights":[],"blind_spots":[]}`)
+
+	require.NoError(t, err)
+	require.NotNil(t, analysis)
+	assert.Equal(t, []string{"agree"}, analysis.Consensus)
 }
 
 func newFusionTestRequest() *Request {

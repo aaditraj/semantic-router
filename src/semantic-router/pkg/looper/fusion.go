@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -339,7 +340,8 @@ func (l *FusionLooper) runFusionAnalysis(
 	if notes := formatGroundingNotes(groundingScores); notes != "" {
 		prompt = prompt + "\n\n" + notes
 	}
-	analysisReq := appendFusionStageMessage(req.OriginalRequest, prompt)
+	analysisReq := buildFusionAnalysisStageRequest(req.OriginalRequest, prompt)
+	analysisReq = stripFusionToolUse(analysisReq)
 	resp, err := l.callFusionModel(ctx, &Request{OriginalRequest: analysisReq, ModelParams: req.ModelParams}, cfg, cfg.Model, false, false, len(panelResponses)+1, config.FusionModelOverride{})
 	if err != nil {
 		logging.ComponentWarnEvent("looper", "fusion_analysis_failed", map[string]interface{}{
@@ -350,6 +352,22 @@ func (l *FusionLooper) runFusionAnalysis(
 	}
 	analysis, parseErr := parseFusionAnalysis(resp.Content)
 	if parseErr != nil {
+		retryPrompt := prompt + "\n\n" +
+			"Your previous response was invalid for parsing.\n" +
+			"Return ONLY one valid JSON object matching the exact schema keys.\n" +
+			"No prose. No markdown. No tool calls. No XML tags."
+		retryReq := buildFusionAnalysisStageRequest(req.OriginalRequest, retryPrompt)
+		retryReq = stripFusionToolUse(retryReq)
+		retryResp, retryErr := l.callFusionModel(ctx, &Request{OriginalRequest: retryReq, ModelParams: req.ModelParams}, cfg, cfg.Model, false, false, len(panelResponses)+1, config.FusionModelOverride{})
+		if retryErr == nil && retryResp != nil {
+			if recovered, recoveredErr := parseFusionAnalysis(retryResp.Content); recoveredErr == nil {
+				logging.ComponentEvent("looper", "fusion_analysis_parse_recovered", map[string]interface{}{
+					"judge_model": cfg.Model,
+				})
+				return recovered, retryResp
+			}
+			resp = retryResp
+		}
 		logging.ComponentWarnEvent("looper", "fusion_analysis_parse_failed", map[string]interface{}{
 			"judge_model": cfg.Model,
 			"error":       parseErr.Error(),
@@ -389,13 +407,25 @@ func buildFusionAnalysisPrompt(cfg fusionExecutionConfig, original string, respo
 	if cfg.AnalysisTemplate != "" {
 		return renderFusionPrompt(cfg.AnalysisTemplate, original, responses, nil)
 	}
-	return fmt.Sprintf(`You are the Fusion analysis judge. Compare the panel responses and return only valid JSON with these keys: consensus, contradictions, partial_coverage, unique_insights, blind_spots. Return compact JSON only: no markdown, no code fences, no prose before or after the JSON. Each value must be an array with at most two concise strings.
-
-Original prompt:
-%s
-
-Panel responses:
-%s`, original, formatPanelResponses(responses))
+	return fmt.Sprintf(
+		"You are the Fusion analysis judge. Compare the panel responses and return only valid JSON.\n"+
+			"Do not call tools. Do not emit tool_call blocks.\n"+
+			"Return exactly one JSON object with these keys: consensus, contradictions, partial_coverage, unique_insights, blind_spots.\n"+
+			"Each value must be an array with at most two concise strings.\n\n"+
+			"Exact expected JSON structure:\n"+
+			"```json\n"+
+			"{\n"+
+			"  \"consensus\": [\"point 1\", \"point 2\"],\n"+
+			"  \"contradictions\": [\"point 1\"],\n"+
+			"  \"partial_coverage\": [],\n"+
+			"  \"unique_insights\": [\"point 1\"],\n"+
+			"  \"blind_spots\": []\n"+
+			"}\n"+
+			"```\n\n"+
+			"Original prompt:\n%s\n\n"+
+			"Panel responses:\n%s",
+		original, formatPanelResponsesForAnalysis(responses),
+	)
 }
 
 func buildFusionFinalPrompt(
@@ -447,18 +477,128 @@ func renderFusionPrompt(template string, original string, responses []*ModelResp
 	return replacer.Replace(template)
 }
 
+// truncatedPanelNotice replaces a panel response that consisted only of a tool
+// call the model never finished emitting. Saying the panel was cut off is safer
+// than showing the judge an empty block, which reads as "this panel had nothing
+// to contribute".
+const truncatedPanelNotice = "[panel response was cut off at the generation cap before producing a complete tool call]"
+
+// stripUnterminatedToolCall removes a <tool_call> the generation never closed.
+//
+// Both judge prompts embed panel content, so an unterminated fragment teaches
+// the judge to emit the same half-written tool call instead of a real one. Any
+// panel cap makes this reachable, because a panel that falls into a repetition
+// loop runs to the ceiling and stops mid-call: under a 1024-token cap 13.7% of
+// generations ended that way (36.2% on django__django-13033) against 0.5%
+// uncapped. The model also sometimes closes with </think> rather than
+// </tool_call>, so anything from the first unclosed <tool_call> onward is
+// discarded rather than trying to repair it.
+func stripUnterminatedToolCall(content string) string {
+	lower := strings.ToLower(content)
+	for search := 0; ; {
+		open := strings.Index(lower[search:], "<tool_call>")
+		if open < 0 {
+			return content
+		}
+		open += search
+		closing := strings.Index(lower[open:], "</tool_call>")
+		if closing < 0 {
+			return strings.TrimSpace(content[:open])
+		}
+		search = open + closing + len("</tool_call>")
+	}
+}
+
+// sanitizePanelContentForPrompt prepares panel output for embedding in a judge
+// prompt. An empty response stays empty; one that survives only as a truncated
+// fragment is reported as such.
+func sanitizePanelContentForPrompt(content string) string {
+	clean := strings.TrimSpace(content)
+	if clean == "" {
+		return ""
+	}
+	stripped := strings.TrimSpace(stripUnterminatedToolCall(clean))
+	if stripped == "" {
+		return truncatedPanelNotice
+	}
+	return stripped
+}
+
 func formatPanelResponses(responses []*ModelResponse) string {
 	var b strings.Builder
 	for i, resp := range responses {
 		if resp == nil {
 			continue
 		}
-		fmt.Fprintf(&b, "Response %d (%s):\n%s\n\n", i+1, resp.Model, resp.Content)
-		if resp.ReasoningContent != "" {
-			fmt.Fprintf(&b, "Reasoning %d (%s):\n%s\n\n", i+1, resp.Model, resp.ReasoningContent)
+		fmt.Fprintf(&b, "Response %d (%s):\n%s\n\n", i+1, resp.Model, sanitizePanelContentForPrompt(resp.Content))
+		if reasoning := strings.TrimSpace(stripUnterminatedToolCall(resp.ReasoningContent)); reasoning != "" {
+			fmt.Fprintf(&b, "Reasoning %d (%s):\n%s\n\n", i+1, resp.Model, reasoning)
 		}
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func formatPanelResponsesForAnalysis(responses []*ModelResponse) string {
+	var b strings.Builder
+	for i, resp := range responses {
+		if resp == nil {
+			continue
+		}
+		fmt.Fprintf(&b, "Response %d (%s):\n%s\n\n", i+1, resp.Model, normalizePanelResponseForAnalysis(resp.Content))
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func normalizePanelResponseForAnalysis(content string) string {
+	clean := sanitizePanelContentForPrompt(content)
+	if clean == "" || clean == truncatedPanelNotice {
+		return clean
+	}
+	if toolName, argsJSON, ok := parseTaggedToolCall(clean); ok {
+		return fmt.Sprintf("Proposed tool call: %s\nArguments JSON: %s", toolName, strings.TrimSpace(argsJSON))
+	}
+	if !strings.Contains(clean, "<tool_call>") {
+		return clean
+	}
+	matches := fusionToolCallBlockRe.FindAllStringSubmatch(clean, -1)
+	if len(matches) == 0 {
+		return clean
+	}
+	steps := make([]string, 0, len(matches))
+	for _, match := range matches {
+		block := strings.TrimSpace(match[1])
+		if block == "" {
+			continue
+		}
+		toolName := strings.TrimSpace(fusionXMLTagRe.ReplaceAllString(strings.SplitN(block, "<arg_key>", 2)[0], ""))
+		if toolName == "" {
+			toolName = "unknown"
+		}
+		var args []string
+		for _, pair := range fusionArgPairRe.FindAllStringSubmatch(block, -1) {
+			key := strings.TrimSpace(fusionXMLTagRe.ReplaceAllString(pair[1], ""))
+			value := strings.TrimSpace(fusionXMLTagRe.ReplaceAllString(pair[2], ""))
+			if key != "" {
+				args = append(args, fmt.Sprintf("%s=%q", key, value))
+			}
+		}
+		step := fmt.Sprintf("Proposed tool call: %s", toolName)
+		if len(args) > 0 {
+			step += " (" + strings.Join(args, ", ") + ")"
+		}
+		steps = append(steps, step)
+	}
+	if len(steps) == 0 {
+		return clean
+	}
+	normalized := strings.Join(steps, "\n")
+	if idx := strings.Index(clean, "<tool_call>"); idx > 0 {
+		preamble := strings.TrimSpace(clean[:idx])
+		if preamble != "" {
+			return preamble + "\n" + normalized
+		}
+	}
+	return normalized
 }
 
 func formatFusionAnalysisForPrompt(analysis *FusionAnalysis) string {
@@ -473,20 +613,172 @@ func formatFusionAnalysisForPrompt(analysis *FusionAnalysis) string {
 }
 
 func parseFusionAnalysis(content string) (*FusionAnalysis, error) {
-	candidates := jsonObjectParseCandidates(content)
+	sanitized := sanitizeFusionAnalysisContent(content)
+	candidates := jsonObjectParseCandidates(sanitized)
+	for _, candidate := range extractBalancedJSONObjects(sanitized) {
+		candidates = appendUniqueNonEmptyString(candidates, candidate)
+	}
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("empty fusion analysis response")
 	}
 	var failures []string
 	for _, candidate := range candidates {
-		var analysis FusionAnalysis
-		if err := json.Unmarshal([]byte(candidate), &analysis); err == nil {
+		analysis, err := parseFusionAnalysisCandidate(candidate)
+		if err == nil {
 			return &analysis, nil
-		} else {
-			failures = append(failures, err.Error())
 		}
+		failures = append(failures, err.Error())
 	}
 	return nil, fmt.Errorf("%s", strings.Join(failures, "; "))
+}
+
+var (
+	fusionThinkBlockRe    = regexp.MustCompile(`(?is)<think>.*?</think>`)
+	fusionToolCallBlockRe = regexp.MustCompile(`(?is)<tool_call>\s*(.*?)\s*</tool_call>`)
+	fusionActionBlockRe   = regexp.MustCompile(`(?is)<\|START_ACTION\|>.*?<\|END_ACTION\|>`)
+	fusionArgPairRe       = regexp.MustCompile(`(?is)<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>`)
+	fusionXMLTagRe        = regexp.MustCompile(`(?is)<[^>]+>`)
+)
+
+func sanitizeFusionAnalysisContent(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return ""
+	}
+	withoutActionBlocks := strings.TrimSpace(fusionActionBlockRe.ReplaceAllString(trimmed, ""))
+	withoutToolCallBlocks := strings.TrimSpace(fusionToolCallBlockRe.ReplaceAllString(withoutActionBlocks, ""))
+	if idx := strings.Index(strings.ToLower(withoutToolCallBlocks), "<tool_call>"); idx >= 0 {
+		withoutToolCallBlocks = strings.TrimSpace(withoutToolCallBlocks[:idx])
+	}
+	if idx := strings.Index(strings.ToLower(withoutToolCallBlocks), "<|start_action|>"); idx >= 0 {
+		withoutToolCallBlocks = strings.TrimSpace(withoutToolCallBlocks[:idx])
+	}
+	withoutThinkBlocks := strings.TrimSpace(fusionThinkBlockRe.ReplaceAllString(withoutToolCallBlocks, ""))
+	withoutThinkBlocks = strings.ReplaceAll(withoutThinkBlocks, "</think>", "\n")
+	withoutThinkBlocks = strings.ReplaceAll(withoutThinkBlocks, "<think>", "\n")
+	return strings.TrimSpace(withoutThinkBlocks)
+}
+
+func parseFusionAnalysisCandidate(candidate string) (FusionAnalysis, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(candidate), &payload); err != nil {
+		return FusionAnalysis{}, err
+	}
+	_, hasConsensus := payload["consensus"]
+	_, hasContradictions := payload["contradictions"]
+	_, hasPartial := payload["partial_coverage"]
+	_, hasInsights := payload["unique_insights"]
+	_, hasBlindSpots := payload["blind_spots"]
+	if !hasConsensus && !hasContradictions && !hasPartial && !hasInsights && !hasBlindSpots {
+		return FusionAnalysis{}, fmt.Errorf("candidate is valid JSON but contains no Fusion analysis keys")
+	}
+
+	analysis := FusionAnalysis{}
+	if values, err := decodeFusionAnalysisList(payload["consensus"]); err != nil {
+		return FusionAnalysis{}, fmt.Errorf("consensus: %w", err)
+	} else {
+		analysis.Consensus = values
+	}
+	if values, err := decodeFusionAnalysisList(payload["contradictions"]); err != nil {
+		return FusionAnalysis{}, fmt.Errorf("contradictions: %w", err)
+	} else {
+		analysis.Contradictions = values
+	}
+	if values, err := decodeFusionAnalysisList(payload["partial_coverage"]); err != nil {
+		return FusionAnalysis{}, fmt.Errorf("partial_coverage: %w", err)
+	} else {
+		analysis.PartialCoverage = values
+	}
+	if values, err := decodeFusionAnalysisList(payload["unique_insights"]); err != nil {
+		return FusionAnalysis{}, fmt.Errorf("unique_insights: %w", err)
+	} else {
+		analysis.UniqueInsights = values
+	}
+	if values, err := decodeFusionAnalysisList(payload["blind_spots"]); err != nil {
+		return FusionAnalysis{}, fmt.Errorf("blind_spots: %w", err)
+	} else {
+		analysis.BlindSpots = values
+	}
+	return analysis, nil
+}
+
+func decodeFusionAnalysisList(raw json.RawMessage) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		single = strings.TrimSpace(single)
+		if single == "" {
+			return []string{}, nil
+		}
+		return []string{single}, nil
+	}
+	var list []string
+	if err := json.Unmarshal(raw, &list); err == nil {
+		return list, nil
+	}
+	var nested [][]string
+	if err := json.Unmarshal(raw, &nested); err == nil {
+		out := make([]string, 0, len(nested))
+		for _, group := range nested {
+			for _, item := range group {
+				item = strings.TrimSpace(item)
+				if item != "" {
+					out = append(out, item)
+				}
+			}
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("expected []string or [][]string")
+}
+
+func extractBalancedJSONObjects(content string) []string {
+	objects := []string{}
+	start := -1
+	depth := 0
+	inString := false
+	escaped := false
+	for i := 0; i < len(content); i++ {
+		ch := content[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+		if ch == '"' {
+			inString = true
+			continue
+		}
+		if ch == '{' {
+			if depth == 0 {
+				start = i
+			}
+			depth++
+			continue
+		}
+		if ch == '}' {
+			if depth == 0 {
+				continue
+			}
+			depth--
+			if depth == 0 && start >= 0 && i >= start {
+				objects = appendUniqueNonEmptyString(objects, strings.TrimSpace(content[start:i+1]))
+				start = -1
+			}
+		}
+	}
+	return objects
 }
 
 func buildFusionTrace(

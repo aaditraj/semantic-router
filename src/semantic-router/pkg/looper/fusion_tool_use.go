@@ -7,6 +7,8 @@ import (
 	"github.com/openai/openai-go"
 )
 
+const fusionAnalysisStageSystemPrompt = "You are the Fusion analysis judge. Output exactly one valid JSON object with only these keys: consensus, contradictions, partial_coverage, unique_insights, blind_spots. Do not call tools. Do not emit markdown, XML tags, or extra prose."
+
 func stripFusionToolUse(req *openai.ChatCompletionNewParams) *openai.ChatCompletionNewParams {
 	if req == nil {
 		return nil
@@ -18,7 +20,6 @@ func stripFusionToolUse(req *openai.ChatCompletionNewParams) *openai.ChatComplet
 	stripped.FunctionCall = openai.ChatCompletionNewParamsFunctionCallUnion{}
 	return stripped
 }
-
 func appendFusionStageMessage(req *openai.ChatCompletionNewParams, content string) *openai.ChatCompletionNewParams {
 	if req == nil {
 		return nil
@@ -50,6 +51,57 @@ func appendFusionStageMessage(req *openai.ChatCompletionNewParams, content strin
 		return req
 	}
 	return &appended
+}
+
+// buildFusionAnalysisStageRequest appends the analysis judge's system
+// instruction and prompt to the conversation, leaving the existing turns
+// untouched.
+//
+// The history must be extended, never rewritten. vLLM's prefix cache keys on
+// the longest common *prefix* of the token sequence, so deleting a message in
+// the middle invalidates every block after it: the panel and synthesis calls
+// send the conversation verbatim, and an analysis request that dropped the
+// assistant turns diverged at the first one and re-prefilled the remainder from
+// scratch. Measured against a 63-message agentic conversation, that dropped
+// prefix reuse from 99.9% to 17% and evicted the shared prefix the other stages
+// depend on, while removing only ~7% of the context (OpenCode's assistant
+// messages carry tool_calls, not text).
+func buildFusionAnalysisStageRequest(req *openai.ChatCompletionNewParams, content string) *openai.ChatCompletionNewParams {
+	if req == nil {
+		return nil
+	}
+	data, err := json.Marshal(req)
+	if err != nil {
+		return req
+	}
+	var reqMap map[string]interface{}
+	if err := json.Unmarshal(data, &reqMap); err != nil {
+		return req
+	}
+	messages, ok := reqMap["messages"].([]interface{})
+	if !ok {
+		return req
+	}
+	extended := make([]interface{}, 0, len(messages)+2)
+	extended = append(extended, messages...)
+	extended = append(extended, map[string]string{
+		"role":    "system",
+		"content": fusionAnalysisStageSystemPrompt,
+	})
+	extended = append(extended, map[string]string{
+		"role":    "user",
+		"content": content,
+	})
+	reqMap["messages"] = extended
+	data, err = json.Marshal(reqMap)
+	if err != nil {
+		return req
+	}
+	var prepared openai.ChatCompletionNewParams
+	if err := json.Unmarshal(data, &prepared); err != nil {
+		return req
+	}
+	return &prepared
 }
 
 func buildFusionStreamingToolCallSSE(

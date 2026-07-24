@@ -10,6 +10,10 @@ func jsonObjectParseCandidates(content string) []string {
 	candidates = appendUniqueNonEmptyString(candidates, extracted)
 	candidates = appendUniqueNonEmptyString(candidates, repairLooseJSONObject(candidate))
 	candidates = appendUniqueNonEmptyString(candidates, repairLooseJSONObject(extracted))
+	candidates = appendUniqueNonEmptyString(candidates, repairUnclosedJSONObject(candidate))
+	candidates = appendUniqueNonEmptyString(candidates, repairUnclosedJSONObject(extracted))
+	candidates = appendUniqueNonEmptyString(candidates, repairLooseJSONObject(repairUnclosedJSONObject(candidate)))
+	candidates = appendUniqueNonEmptyString(candidates, repairLooseJSONObject(repairUnclosedJSONObject(extracted)))
 	return candidates
 }
 
@@ -30,6 +34,20 @@ func stripMarkdownJSONFence(value string) string {
 	value = strings.TrimSpace(value)
 	if !strings.HasPrefix(value, "```") {
 		return value
+	}
+	if strings.Count(value, "```") >= 2 {
+		first := strings.Index(value, "```")
+		if first >= 0 {
+			rest := value[first+3:]
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(rest)), "json") {
+				trimmed := strings.TrimSpace(rest)
+				trimmed = trimmed[4:]
+				rest = strings.TrimLeft(trimmed, " \t\r\n")
+			}
+			if end := strings.LastIndex(rest, "```"); end >= 0 {
+				return strings.TrimSpace(rest[:end])
+			}
+		}
 	}
 	lines := strings.Split(value, "\n")
 	if len(lines) > 0 && strings.HasPrefix(strings.TrimSpace(lines[0]), "```") {
@@ -52,6 +70,63 @@ func extractJSONObject(value string) string {
 
 func repairLooseJSONObject(value string) string {
 	return removeJSONTrailingCommas(repairInvalidJSONEscapes(repairJSONBackticks(value)))
+}
+
+func repairUnclosedJSONObject(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return value
+	}
+	var stack []rune
+	inString := false
+	escaped := false
+	for _, r := range value {
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if r == '\\' {
+				escaped = true
+				continue
+			}
+			if r == '"' {
+				inString = false
+			}
+			continue
+		}
+		if r == '"' {
+			inString = true
+			continue
+		}
+		if r == '{' || r == '[' {
+			stack = append(stack, r)
+			continue
+		}
+		if r == '}' || r == ']' {
+			if len(stack) == 0 {
+				continue
+			}
+			top := stack[len(stack)-1]
+			if (top == '{' && r == '}') || (top == '[' && r == ']') {
+				stack = stack[:len(stack)-1]
+			}
+		}
+	}
+	if len(stack) == 0 {
+		return value
+	}
+	var b strings.Builder
+	b.Grow(len(value) + len(stack))
+	b.WriteString(value)
+	for i := len(stack) - 1; i >= 0; i-- {
+		if stack[i] == '{' {
+			b.WriteRune('}')
+		} else {
+			b.WriteRune(']')
+		}
+	}
+	return b.String()
 }
 
 func repairJSONBackticks(value string) string {
