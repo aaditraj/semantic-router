@@ -19,6 +19,8 @@ var BaselineRouterContract = []string{
 	"semantic-cache",
 	"pii-detection",
 	"jailbreak-detection",
+	// Profile-aware testcase: baseline uses static_business_route expectations,
+	// while dynamic-config preserves legacy thinking/math/business names.
 	"decision-priority-selection",
 	"plugin-chain-execution",
 	"tool-selection",

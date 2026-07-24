@@ -53,37 +53,7 @@ func testDecisionPriority(ctx context.Context, client *kubernetes.Clientset, opt
 	}
 	defer stopPortForward()
 
-	// Define test cases inline
-	testCases := []DecisionPriorityCase{
-		{
-			Query:             "Think carefully about this urgent business decision",
-			ExpectedDecision:  "thinking_decision",
-			ExpectedPriority:  15,
-			MatchingDecisions: []string{"thinking_decision", "business_decision"},
-			Description:       "Query matches both thinking (priority 15) and business (priority 10) - should select higher priority",
-		},
-		{
-			Query:             "I need to think about complex math problems",
-			ExpectedDecision:  "thinking_decision",
-			ExpectedPriority:  15,
-			MatchingDecisions: []string{"thinking_decision", "math_decision"},
-			Description:       "Query matches thinking (priority 15) and math (priority 10) - should select higher priority",
-		},
-		{
-			Query:             "What is 2 + 2?",
-			ExpectedDecision:  "math_decision",
-			ExpectedPriority:  10,
-			MatchingDecisions: []string{"math_decision"},
-			Description:       "Simple math query should match math decision (priority 10)",
-		},
-		{
-			Query:             "Tell me about cellular biology",
-			ExpectedDecision:  "biology_decision",
-			ExpectedPriority:  10,
-			MatchingDecisions: []string{"biology_decision"},
-			Description:       "Biology query should match biology decision (priority 10)",
-		},
-	}
+	testCases := decisionPriorityCasesForProfile(opts.Profile)
 
 	// Run priority tests
 	var results []DecisionPriorityResult
@@ -126,6 +96,70 @@ func testDecisionPriority(ctx context.Context, client *kubernetes.Clientset, opt
 	}
 
 	return nil
+}
+
+func decisionPriorityCasesForProfile(profile string) []DecisionPriorityCase {
+	// dynamic-config profile keeps the legacy CRD decision names used by the
+	// original priority testcase.
+	if profile == "dynamic-config" {
+		return []DecisionPriorityCase{
+			{
+				Query:             "Think carefully about this urgent business decision",
+				ExpectedDecision:  "thinking_decision",
+				ExpectedPriority:  15,
+				MatchingDecisions: []string{"thinking_decision", "business_decision"},
+				Description:       "Query matches both thinking (priority 15) and business (priority 10) - should select higher priority",
+			},
+			{
+				Query:             "I need to think about complex math problems",
+				ExpectedDecision:  "thinking_decision",
+				ExpectedPriority:  15,
+				MatchingDecisions: []string{"thinking_decision", "math_decision"},
+				Description:       "Query matches thinking (priority 15) and math (priority 10) - should select higher priority",
+			},
+			{
+				Query:             "What is 2 + 2?",
+				ExpectedDecision:  "math_decision",
+				ExpectedPriority:  10,
+				MatchingDecisions: []string{"math_decision"},
+				Description:       "Simple math query should match math decision (priority 10)",
+			},
+			{
+				Query:             "Tell me about cellular biology",
+				ExpectedDecision:  "biology_decision",
+				ExpectedPriority:  10,
+				MatchingDecisions: []string{"biology_decision"},
+				Description:       "Biology query should match biology decision (priority 10)",
+			},
+		}
+	}
+
+	// Baseline kubernetes profile uses newer algorithmic routes and priorities.
+	// These prompts intentionally overlap multiple decisions (business + urgent),
+	// where static_business_route should win by highest priority (200).
+	return []DecisionPriorityCase{
+		{
+			Query:             "This is an urgent business strategy decision for market expansion.",
+			ExpectedDecision:  "static_business_route",
+			ExpectedPriority:  200,
+			MatchingDecisions: []string{"static_business_route", "urgent_automix_route", "safe_hybrid_route"},
+			Description:       "Business+urgent prompt can match multiple routes, baseline should select highest-priority static_business_route",
+		},
+		{
+			Query:             "Urgent business plan: think through pricing and positioning tradeoffs.",
+			ExpectedDecision:  "static_business_route",
+			ExpectedPriority:  200,
+			MatchingDecisions: []string{"static_business_route", "urgent_automix_route", "safe_hybrid_route"},
+			Description:       "Second overlapping business+urgent case verifies consistent highest-priority selection in baseline profile",
+		},
+		{
+			Query:             "What are the core drivers of market share in a mature business category?",
+			ExpectedDecision:  "static_business_route",
+			ExpectedPriority:  200,
+			MatchingDecisions: []string{"static_business_route"},
+			Description:       "Business-only prompt should route to static_business_route in baseline profile",
+		},
+	}
 }
 
 func testSinglePrioritySelection(ctx context.Context, testCase DecisionPriorityCase, localPort string, verbose bool) DecisionPriorityResult {
