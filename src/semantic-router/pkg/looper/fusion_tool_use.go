@@ -3,6 +3,7 @@ package looper
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/openai/openai-go"
 )
@@ -67,6 +68,17 @@ func appendFusionStageMessage(req *openai.ChatCompletionNewParams, content strin
 // depend on, while removing only ~7% of the context (OpenCode's assistant
 // messages carry tool_calls, not text).
 func buildFusionAnalysisStageRequest(req *openai.ChatCompletionNewParams, content string) *openai.ChatCompletionNewParams {
+	return appendFusionStageTurns(req, fusionAnalysisStageSystemPrompt, content)
+}
+
+// appendFusionStageTurns extends the conversation with an optional stage
+// instruction followed by the stage prompt. An empty instruction appends only
+// the prompt, so a stage with nothing to declare keeps its previous shape.
+func appendFusionStageTurns(
+	req *openai.ChatCompletionNewParams,
+	systemContent string,
+	userContent string,
+) *openai.ChatCompletionNewParams {
 	if req == nil {
 		return nil
 	}
@@ -84,13 +96,15 @@ func buildFusionAnalysisStageRequest(req *openai.ChatCompletionNewParams, conten
 	}
 	extended := make([]interface{}, 0, len(messages)+2)
 	extended = append(extended, messages...)
-	extended = append(extended, map[string]string{
-		"role":    "system",
-		"content": fusionAnalysisStageSystemPrompt,
-	})
+	if strings.TrimSpace(systemContent) != "" {
+		extended = append(extended, map[string]string{
+			"role":    "system",
+			"content": systemContent,
+		})
+	}
 	extended = append(extended, map[string]string{
 		"role":    "user",
-		"content": content,
+		"content": userContent,
 	})
 	reqMap["messages"] = extended
 	data, err = json.Marshal(reqMap)

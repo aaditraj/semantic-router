@@ -174,6 +174,41 @@ func TestMergeFusionRequestConfigCoversAdvancedOptions(t *testing.T) {
 	assert.Equal(t, config.FusionOnErrorFail, dst.GroundingOnError)
 }
 
+func TestResolveFusionExecutionConfigLayersAnalysisOverridesFieldWise(t *testing.T) {
+	looper := NewFusionLooper(&config.LooperConfig{Endpoint: "http://looper"})
+	req := newFusionTestRequest()
+	req.Algorithm = &config.AlgorithmConfig{
+		Type: "fusion",
+		Fusion: &config.FusionAlgorithmConfig{
+			Model:          "judge",
+			AnalysisModels: []string{"panel-a", "panel-b"},
+			AnalysisOverrides: []config.FusionModelOverride{
+				{Model: "panel-a", Temperature: float64Ptr(0.2), MaxCompletionTokens: 512},
+				{Model: "panel-b", Temperature: float64Ptr(0.8)},
+			},
+		},
+	}
+	req.Fusion = &config.FusionRequestConfig{
+		ID: "fusion",
+		AnalysisOverrides: []config.FusionModelOverride{
+			{Model: "panel-a", MaxCompletionTokens: 100},
+			{Model: "panel-b", Temperature: float64Ptr(0.1)},
+		},
+	}
+
+	cfg := looper.resolveFusionExecutionConfig(req)
+
+	require.Len(t, cfg.AnalysisOverrides, 2)
+	panelA := cfg.AnalysisOverrides["panel-a"]
+	require.NotNil(t, panelA.Temperature)
+	assert.Equal(t, 0.2, *panelA.Temperature)
+	assert.Equal(t, 100, panelA.MaxCompletionTokens)
+	panelB := cfg.AnalysisOverrides["panel-b"]
+	require.NotNil(t, panelB.Temperature)
+	assert.Equal(t, 0.1, *panelB.Temperature)
+	assert.Zero(t, panelB.MaxCompletionTokens)
+}
+
 func TestFusionLooperAppliesPerAnalysisOverrides(t *testing.T) {
 	type callParams struct {
 		temperature         *float64
@@ -353,7 +388,7 @@ func TestFusionLooperAllowsFinalJudgeToolCallsOnly(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	assertFusionToolCallObservations(t, observations, 4)
+	assertFusionToolCallObservations(t, observations, 3)
 
 	var body map[string]interface{}
 	require.NoError(t, json.Unmarshal(resp.Body, &body))
@@ -367,7 +402,7 @@ func TestFusionLooperAllowsFinalJudgeToolCallsOnly(t *testing.T) {
 		Usage TokenUsage `json:"usage"`
 	}
 	require.NoError(t, json.Unmarshal(resp.Body, &usageBody))
-	assert.Equal(t, TokenUsage{PromptTokens: 90, CompletionTokens: 13, TotalTokens: 103}, usageBody.Usage)
+	assert.Equal(t, TokenUsage{PromptTokens: 60, CompletionTokens: 9, TotalTokens: 69}, usageBody.Usage)
 }
 
 func TestFusionLooperStreamsFinalJudgeToolCalls(t *testing.T) {
