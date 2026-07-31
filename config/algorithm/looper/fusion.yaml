@@ -14,3 +14,6 @@ algorithm:
     include_intermediate_responses: true
     on_error: skip
     judge_prompt_version: fusion-v1
+    analysis_parse_retry: true
+    skip_analysis_on_agreement: false
+    agentic_judge_rules: false

@@ -50,6 +50,24 @@ type FusionAlgorithmConfig struct {
 	JudgePromptVersion           string                 `yaml:"judge_prompt_version,omitempty" json:"judge_prompt_version,omitempty"`
 	IncludeIntermediateResponses *bool                  `yaml:"include_intermediate_responses,omitempty" json:"include_intermediate_responses,omitempty"`
 	Grounding                    *FusionGroundingConfig `yaml:"grounding,omitempty" json:"grounding,omitempty"`
+
+	// AnalysisParseRetry re-asks the judge once when its analysis reply cannot
+	// be parsed as the expected JSON. Defaults to enabled: the alternative on
+	// that path is losing the analysis for the request entirely, and the retry
+	// costs one extra judge call only on a reply that already failed.
+	AnalysisParseRetry *bool `yaml:"analysis_parse_retry,omitempty" json:"analysis_parse_retry,omitempty"`
+
+	// SkipAnalysisOnAgreement skips the judge's analysis call when the panel
+	// proposed the same action, since there is nothing to adjudicate. Off by
+	// default because it changes the model-call count and the trace a caller
+	// sees.
+	SkipAnalysisOnAgreement *bool `yaml:"skip_analysis_on_agreement,omitempty" json:"skip_analysis_on_agreement,omitempty"`
+
+	// AgenticJudgeRules adds standing rules to the synthesis prompt for a judge
+	// that is driving a tool-calling agent loop rather than answering a single
+	// question. Off by default, and ignored when the decision's
+	// output_contract_spec constrains the final response shape.
+	AgenticJudgeRules *bool `yaml:"agentic_judge_rules,omitempty" json:"agentic_judge_rules,omitempty"`
 }
 
 // FusionGroundingConfig configures the optional grounding stage that scores each
@@ -93,6 +111,9 @@ type FusionRequestConfig struct {
 	SynthesisTemplate            string                 `json:"synthesis_template,omitempty" yaml:"synthesis_template,omitempty"`
 	JudgePromptVersion           string                 `json:"judge_prompt_version,omitempty" yaml:"judge_prompt_version,omitempty"`
 	Grounding                    *FusionGroundingConfig `json:"grounding,omitempty" yaml:"grounding,omitempty"`
+	AnalysisParseRetry           *bool                  `json:"analysis_parse_retry,omitempty" yaml:"analysis_parse_retry,omitempty"`
+	SkipAnalysisOnAgreement      *bool                  `json:"skip_analysis_on_agreement,omitempty" yaml:"skip_analysis_on_agreement,omitempty"`
+	AgenticJudgeRules            *bool                  `json:"agentic_judge_rules,omitempty" yaml:"agentic_judge_rules,omitempty"`
 }
 
 // FusionModelOverride allows per-analysis-model sampling overrides.

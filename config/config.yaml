@@ -830,6 +830,20 @@ routing:
           analysis_template: ""
           synthesis_template: ""
           judge_prompt_version: fusion-v1
+          # Judge behavior switches.
+          #   analysis_parse_retry         re-ask the judge once when its analysis
+          #                                reply cannot be parsed (default true).
+          #   skip_analysis_on_agreement   skip the analysis call when the panel
+          #                                proposed the same action; changes the
+          #                                model-call count and trace.
+          #   agentic_judge_rules          standing rules for a judge driving a
+          #                                tool-calling loop (plan upkeep, no
+          #                                completion claim without a test run).
+          #                                Ignored when output_contract_spec
+          #                                declares the final response shape.
+          analysis_parse_retry: true
+          skip_analysis_on_agreement: true
+          agentic_judge_rules: true
           # Grounding-aware synthesis: score panel responses for faithfulness
           # (hallucination detector against context, else cross-model NLI) and
           # use the scores to guide the judge. Disabled by default.

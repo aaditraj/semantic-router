@@ -7,6 +7,8 @@ import (
 	"github.com/openai/openai-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 )
 
 // agenticJudgeRequest mimics an OpenCode turn: a real task, tool-calling
@@ -122,6 +124,44 @@ func TestAppendFusionStageTurnsSkipsEmptySystemTurn(t *testing.T) {
 	require.Len(t, extended, len(original)+1)
 	last := extended[len(extended)-1].(map[string]interface{})
 	assert.Equal(t, "user", last["role"])
+}
+
+func TestFusionStageRulesOffByDefault(t *testing.T) {
+	looper := NewFusionLooper(&config.LooperConfig{})
+	req := &Request{OriginalRequest: agenticJudgeRequest(t), DecisionName: "fusion-test"}
+
+	assert.Empty(t, looper.fusionStageRules(req, fusionExecutionConfig{}))
+}
+
+func TestFusionStageRulesAppliedWhenEnabled(t *testing.T) {
+	looper := NewFusionLooper(&config.LooperConfig{})
+	req := &Request{OriginalRequest: agenticJudgeRequest(t), DecisionName: "fusion-test"}
+
+	rules := looper.fusionStageRules(req, fusionExecutionConfig{AgenticJudgeRules: true})
+
+	assert.Contains(t, rules, "acting agent in a multi-turn loop")
+}
+
+// A decision that declares its final response shape owns it. "Calling a tool is
+// a valid result for this turn" would fight a choice contract, and a tool-call
+// response also skips contract normalization entirely.
+func TestFusionStageRulesStandDownForDeclaredOutputShape(t *testing.T) {
+	looper := NewFusionLooper(&config.LooperConfig{})
+	for _, spec := range []*config.OutputContractSpec{
+		{Type: config.OutputContractTypeChoice},
+		{Type: config.OutputContractTypeStructuredJSON},
+		{Type: config.OutputContractTypeReferenceSelect},
+	} {
+		req := &Request{
+			OriginalRequest:    agenticJudgeRequest(t),
+			DecisionName:       "fusion-test",
+			OutputContractSpec: spec,
+		}
+
+		rules := looper.fusionStageRules(req, fusionExecutionConfig{AgenticJudgeRules: true})
+
+		assert.Empty(t, rules, "contract type %q must win over algorithm prompt text", spec.Type)
+	}
 }
 
 func TestFusionAnalysisPromptAsksForCheckableContradictions(t *testing.T) {

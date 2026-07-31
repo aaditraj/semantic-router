@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
-	"regexp"
 	"strings"
 	"time"
 
@@ -40,6 +38,10 @@ type fusionExecutionConfig struct {
 	AnalysisTemplate             string
 	SynthesisTemplate            string
 	JudgePromptVersion           string
+
+	AnalysisParseRetry      bool
+	SkipAnalysisOnAgreement bool
+	AgenticJudgeRules       bool
 
 	GroundingEnabled                 bool
 	GroundingReference               string
@@ -90,13 +92,6 @@ type fusionPanelResult struct {
 	err   error
 }
 
-const fusionAnalysisSkipSimilarityThreshold = 0.92
-
-type fusionAnalysisGateDecision struct {
-	run    bool
-	reason string
-}
-
 func (l *FusionLooper) Execute(ctx context.Context, req *Request) (*Response, error) {
 	l.client.SetDecisionName(req.DecisionName)
 	l.client.SetFusionDepth(1)
@@ -144,14 +139,16 @@ func (l *FusionLooper) Execute(ctx context.Context, req *Request) (*Response, er
 
 	analysis := (*FusionAnalysis)(nil)
 	analysisResp := (*ModelResponse)(nil)
-	filteredContradictions := 0
-	gate := shouldRunFusionAnalysis(groundedPanel)
+	skipReason := ""
+	droppedContradictions := 0
+	gate := shouldRunFusionAnalysis(groundedPanel, cfg.SkipAnalysisOnAgreement)
 	if gate.run {
 		analysis, analysisResp = l.runFusionAnalysis(ctx, req, cfg, groundedPanel, groundingScores)
 		if analysis != nil {
-			analysis.Contradictions, filteredContradictions = filterFusionArtifactContradictions(analysis.Contradictions)
+			analysis.Contradictions, droppedContradictions = filterNonContrastiveContradictions(analysis.Contradictions)
 		}
 	} else {
+		skipReason = gate.reason
 		logging.ComponentEvent("looper", "fusion_analysis_skipped", map[string]interface{}{
 			"decision": req.DecisionName,
 			"reason":   gate.reason,
@@ -164,7 +161,7 @@ func (l *FusionLooper) Execute(ctx context.Context, req *Request) (*Response, er
 	}
 	usage := SumUsage(panelResponses...).Add(analysisResp, finalResp)
 
-	trace := buildFusionTrace(cfg, groundedPanel, failedModels, analysis, gate.reason, filteredContradictions, groundingMode, groundingScores)
+	trace := buildFusionTrace(cfg, groundedPanel, failedModels, analysis, skipReason, droppedContradictions, groundingMode, groundingScores)
 	modelsUsed := orderedFusionModelsUsed(cfg.AnalysisModels, cfg.Model)
 	iterations := len(cfg.AnalysisModels) + 2
 	if !gate.run {
@@ -313,167 +310,6 @@ func compactFusionPanelResponses(ordered []*ModelResponse) []*ModelResponse {
 	return responses
 }
 
-func shouldRunFusionAnalysis(panelResponses []*ModelResponse) fusionAnalysisGateDecision {
-	if len(panelResponses) < 2 {
-		return fusionAnalysisGateDecision{run: true, reason: "insufficient_panel_responses"}
-	}
-	if len(panelResponses) > 2 {
-		// Keep the first version conservative. Two-panel fusion is the dominant
-		// path today; for larger panels we can add a consensus gate later.
-		return fusionAnalysisGateDecision{run: true, reason: "panel_count_gt_two"}
-	}
-	leftRaw, left := fusionGateContents(panelResponses[0])
-	rightRaw, right := fusionGateContents(panelResponses[1])
-	if left == "" || right == "" {
-		return fusionAnalysisGateDecision{run: true, reason: "empty_panel_output"}
-	}
-	if left == right {
-		return fusionAnalysisGateDecision{run: false, reason: "equivalent_panel_content"}
-	}
-
-	leftTool, leftArgs, leftTagged := parseTaggedToolCall(leftRaw)
-	rightTool, rightArgs, rightTagged := parseTaggedToolCall(rightRaw)
-	if leftTagged && rightTagged {
-		if strings.EqualFold(strings.TrimSpace(leftTool), strings.TrimSpace(rightTool)) && fusionJSONArgsEquivalent(leftArgs, rightArgs) {
-			return fusionAnalysisGateDecision{run: false, reason: "equivalent_tagged_tool_call"}
-		}
-		return fusionAnalysisGateDecision{run: true, reason: "different_tagged_tool_call"}
-	}
-
-	sim := fusionJaccardSimilarity(left, right)
-	if sim >= fusionAnalysisSkipSimilarityThreshold {
-		return fusionAnalysisGateDecision{run: false, reason: fmt.Sprintf("high_overlap_%.2f", sim)}
-	}
-	return fusionAnalysisGateDecision{run: true, reason: fmt.Sprintf("disagreement_%.2f", sim)}
-}
-
-func fusionGateContents(resp *ModelResponse) (raw string, normalized string) {
-	if resp == nil {
-		return "", ""
-	}
-	// Reuse the same prompt sanitizer the judge sees so the gate keys off the
-	// same representation (e.g. truncated tool-call tails stripped).
-	content := sanitizePanelContentForPrompt(resp.Content)
-	raw = strings.TrimSpace(content)
-	content = strings.ToLower(raw)
-	if raw == "" {
-		return "", ""
-	}
-	content = fusionWordBoundaryRe.ReplaceAllString(content, " ")
-	content = strings.Join(strings.Fields(content), " ")
-	return raw, content
-}
-
-func fusionJSONArgsEquivalent(left string, right string) bool {
-	var a any
-	var b any
-	if err := json.Unmarshal([]byte(left), &a); err != nil {
-		return strings.TrimSpace(left) == strings.TrimSpace(right)
-	}
-	if err := json.Unmarshal([]byte(right), &b); err != nil {
-		return strings.TrimSpace(left) == strings.TrimSpace(right)
-	}
-	return fusionDeepEqualJSON(a, b)
-}
-
-func fusionDeepEqualJSON(a any, b any) bool {
-	switch av := a.(type) {
-	case map[string]any:
-		bv, ok := b.(map[string]any)
-		if !ok || len(av) != len(bv) {
-			return false
-		}
-		for k, v := range av {
-			other, ok := bv[k]
-			if !ok || !fusionDeepEqualJSON(v, other) {
-				return false
-			}
-		}
-		return true
-	case []any:
-		bv, ok := b.([]any)
-		if !ok || len(av) != len(bv) {
-			return false
-		}
-		for i := range av {
-			if !fusionDeepEqualJSON(av[i], bv[i]) {
-				return false
-			}
-		}
-		return true
-	case float64:
-		bf, ok := b.(float64)
-		return ok && math.Abs(av-bf) <= 1e-9
-	default:
-		return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
-	}
-}
-
-func fusionJaccardSimilarity(left string, right string) float64 {
-	leftTokens := fusionTokenSet(left)
-	rightTokens := fusionTokenSet(right)
-	if len(leftTokens) == 0 || len(rightTokens) == 0 {
-		return 0
-	}
-	intersection := 0
-	union := make(map[string]struct{}, len(leftTokens)+len(rightTokens))
-	for token := range leftTokens {
-		union[token] = struct{}{}
-		if _, ok := rightTokens[token]; ok {
-			intersection++
-		}
-	}
-	for token := range rightTokens {
-		union[token] = struct{}{}
-	}
-	return float64(intersection) / float64(len(union))
-}
-
-func fusionTokenSet(content string) map[string]struct{} {
-	out := map[string]struct{}{}
-	for _, token := range strings.Fields(content) {
-		if token == "" {
-			continue
-		}
-		out[token] = struct{}{}
-	}
-	return out
-}
-
-var fusionArtifactContradictionPatterns = []string{
-	"no panel edited",
-	"neither panel edited",
-	"none of the panels edited",
-	"no edits were made by either panel",
-	"no panel made any edits",
-	"both panels made no edits",
-	"neither panel made edits",
-}
-
-func filterFusionArtifactContradictions(in []string) ([]string, int) {
-	if len(in) == 0 {
-		return in, 0
-	}
-	out := make([]string, 0, len(in))
-	filtered := 0
-	for _, item := range in {
-		lowered := strings.ToLower(strings.TrimSpace(item))
-		isArtifact := false
-		for _, pattern := range fusionArtifactContradictionPatterns {
-			if strings.Contains(lowered, pattern) {
-				isArtifact = true
-				break
-			}
-		}
-		if isArtifact {
-			filtered++
-			continue
-		}
-		out = append(out, item)
-	}
-	return out, filtered
-}
-
 func (l *FusionLooper) callFusionModel(
 	ctx context.Context,
 	req *Request,
@@ -541,21 +377,14 @@ func (l *FusionLooper) runFusionAnalysis(
 	}
 	analysis, parseErr := parseFusionAnalysis(resp.Content)
 	if parseErr != nil {
-		retryPrompt := prompt + "\n\n" +
-			"Your previous response was invalid for parsing.\n" +
-			"Return ONLY one valid JSON object matching the exact schema keys.\n" +
-			"No prose. No markdown. No tool calls. No XML tags."
-		retryReq := buildFusionAnalysisStageRequest(req.OriginalRequest, retryPrompt)
-		retryReq = stripFusionToolUse(retryReq)
-		retryResp, retryErr := l.callFusionModel(ctx, &Request{OriginalRequest: retryReq, ModelParams: req.ModelParams}, cfg, cfg.Model, false, false, len(panelResponses)+1, config.FusionModelOverride{})
-		if retryErr == nil && retryResp != nil {
-			if recovered, recoveredErr := parseFusionAnalysis(retryResp.Content); recoveredErr == nil {
-				logging.ComponentEvent("looper", "fusion_analysis_parse_recovered", map[string]interface{}{
-					"judge_model": cfg.Model,
-				})
+		if cfg.AnalysisParseRetry {
+			recovered, retryResp := l.retryFusionAnalysis(ctx, req, cfg, prompt, len(panelResponses))
+			if recovered != nil {
 				return recovered, retryResp
 			}
-			resp = retryResp
+			if retryResp != nil {
+				resp = retryResp
+			}
 		}
 		logging.ComponentWarnEvent("looper", "fusion_analysis_parse_failed", map[string]interface{}{
 			"judge_model": cfg.Model,
@@ -564,6 +393,39 @@ func (l *FusionLooper) runFusionAnalysis(
 		return &FusionAnalysis{Raw: resp.Content, ParseFailed: true}, resp
 	}
 	return analysis, resp
+}
+
+// retryFusionAnalysis re-asks the judge for its analysis after an unparsable
+// reply, naming the failure so the model has something to correct. It returns
+// the recovered analysis when the second reply parses, and otherwise the second
+// response alone so the trace records the more recent attempt.
+//
+// Enabled by algorithm.fusion.analysis_parse_retry, on by default: the reply
+// being retried has already cost a judge call and produced nothing usable.
+func (l *FusionLooper) retryFusionAnalysis(
+	ctx context.Context,
+	req *Request,
+	cfg fusionExecutionConfig,
+	prompt string,
+	panelSize int,
+) (*FusionAnalysis, *ModelResponse) {
+	retryPrompt := prompt + "\n\n" +
+		"Your previous response was invalid for parsing.\n" +
+		"Return ONLY one valid JSON object matching the exact schema keys.\n" +
+		"No prose. No markdown. No tool calls. No XML tags."
+	retryReq := stripFusionToolUse(buildFusionAnalysisStageRequest(req.OriginalRequest, retryPrompt))
+	resp, err := l.callFusionModel(ctx, &Request{OriginalRequest: retryReq, ModelParams: req.ModelParams}, cfg, cfg.Model, false, false, panelSize+1, config.FusionModelOverride{})
+	if err != nil || resp == nil {
+		return nil, nil
+	}
+	recovered, parseErr := parseFusionAnalysis(resp.Content)
+	if parseErr != nil {
+		return nil, resp
+	}
+	logging.ComponentEvent("looper", "fusion_analysis_parse_recovered", map[string]interface{}{
+		"judge_model": cfg.Model,
+	})
+	return recovered, resp
 }
 
 func (l *FusionLooper) runFusionFinal(
@@ -582,12 +444,10 @@ func (l *FusionLooper) runFusionFinal(
 	if notes := groundingSynthesisNotes(groundingScores, cfg.GroundingPolicy); notes != "" {
 		prompt = prompt + "\n\n" + notes
 	}
-	// Affordances come off the original request; the synthesis call keeps its
-	// tools, so these are the ones the judge can actually reach for. The rules
-	// ride as a trailing system turn for the same prefix-cache reason the
-	// analysis stage does: the shared conversation prefix stays byte-identical
-	// across all three stages.
-	stageRules := fusionSynthesisStageRules(detectJudgeToolAffordances(req.OriginalRequest))
+	// The rules ride as a trailing system turn for the same prefix-cache reason
+	// the analysis stage does: the shared conversation prefix stays
+	// byte-identical across all three stages.
+	stageRules := l.fusionStageRules(req, cfg)
 	finalReq := appendFusionStageTurns(req.OriginalRequest, stageRules, prompt)
 	resp, err := l.callFusionModel(ctx, &Request{OriginalRequest: finalReq, ModelParams: req.ModelParams}, cfg, cfg.Model, true, false, len(panelResponses)+2, config.FusionModelOverride{})
 	if err != nil {
@@ -598,398 +458,28 @@ func (l *FusionLooper) runFusionFinal(
 	return resp, nil
 }
 
-func buildFusionAnalysisPrompt(cfg fusionExecutionConfig, original string, responses []*ModelResponse) string {
-	if cfg.AnalysisTemplate != "" {
-		return renderFusionPrompt(cfg.AnalysisTemplate, original, responses, nil)
-	}
-	return fmt.Sprintf(
-		"You are the Fusion analysis judge. Compare the panel responses and return only valid JSON.\n"+
-			"Do not call tools. Do not emit tool_call blocks.\n"+
-			"Return exactly one JSON object with these keys: consensus, contradictions, partial_coverage, unique_insights, blind_spots.\n"+
-			"Each value must be an array with at most two concise strings.\n\n"+
-			"Exact expected JSON structure:\n"+
-			"```json\n"+
-			"{\n"+
-			"  \"consensus\": [\"point 1\", \"point 2\"],\n"+
-			"  \"contradictions\": [\"point 1\"],\n"+
-			"  \"partial_coverage\": [],\n"+
-			"  \"unique_insights\": [\"point 1\"],\n"+
-			"  \"blind_spots\": []\n"+
-			"}\n"+
-			"```\n\n"+
-			"%s\n"+
-			"Original prompt:\n%s\n\n"+
-			"Panel responses:\n%s",
-		fusionContradictionGuidance, original, formatPanelResponsesForAnalysis(responses),
-	)
-}
-
-// fusionContradictionGuidance steers the judge toward disagreements that can be
-// settled by evidence.
+// fusionStageRules returns the standing rules for the synthesis turn, or an
+// empty string when they do not apply.
 //
-// Contradictions about a concrete value or test contract are 43.5% of the
-// contradictions raised on solved SWE-bench tasks and 1.7% on failed ones,
-// while open-ended "which approach is better" disagreements run the other way
-// (280 on failures against 159 on solves). So the prompt asks for the first
-// kind by construction and routes the second into partial_coverage.
-const fusionContradictionGuidance = "State each contradiction as a claim about a concrete value, state, or behaviour: " +
-	"name what one panel expects and what the other expects, such as \"panel 1 expects the call to return " +
-	"'utils_tests.test_module', panel 2 expects 'tests.utils_tests.test_module'\". Prefer disagreements that " +
-	"reading a file or running a command would settle. If the panels differ only in wording, style, or how much " +
-	"detail they give, that is partial_coverage, not a contradiction.\n"
-
-func buildFusionFinalPrompt(
-	cfg fusionExecutionConfig,
-	original string,
-	outputContract string,
-	responses []*ModelResponse,
-	analysis *FusionAnalysis,
-) string {
-	if cfg.SynthesisTemplate != "" {
-		return appendOutputContractForPrompt(
-			renderFusionPrompt(cfg.SynthesisTemplate, original, responses, analysis),
-			outputContract,
-		)
-	}
-	analysisBlock := "No structured analysis is available. Synthesize directly from the panel responses."
-	if analysis != nil && !analysis.ParseFailed {
-		if data, err := json.MarshalIndent(analysis, "", "  "); err == nil {
-			analysisBlock = string(data)
-		}
-	}
-	prompt := fmt.Sprintf(`You are the Fusion calling model. Produce the final answer for the user using the panel responses and structured analysis. Resolve contradictions explicitly and do not mention internal model names unless the user asks.
-
-Rules:
-- Preserve the original output contract exactly.
-- Do not reveal hidden reasoning, scratch work, panel reasoning, tool traces, or internal deliberation.
-- Provide a concise explanation only when the original output contract asks for one.
-
-Original prompt:
-%s
-
-Structured analysis:
-%s
-
-Panel responses:
-%s
-
-Final answer:`, original, analysisBlock, formatPanelResponses(responses))
-
-	return appendOutputContractForPrompt(prompt, outputContract)
-}
-
-func renderFusionPrompt(template string, original string, responses []*ModelResponse, analysis *FusionAnalysis) string {
-	replacer := strings.NewReplacer(
-		"{{original}}", original,
-		"{{responses}}", formatPanelResponses(responses),
-		"{{analysis}}", formatFusionAnalysisForPrompt(analysis),
-	)
-	return replacer.Replace(template)
-}
-
-// truncatedPanelNotice replaces a panel response that consisted only of a tool
-// call the model never finished emitting. Saying the panel was cut off is safer
-// than showing the judge an empty block, which reads as "this panel had nothing
-// to contribute".
-const truncatedPanelNotice = "[panel response was cut off at the generation cap before producing a complete tool call]"
-
-// stripUnterminatedToolCall removes a <tool_call> the generation never closed.
-//
-// Both judge prompts embed panel content, so an unterminated fragment teaches
-// the judge to emit the same half-written tool call instead of a real one. Any
-// panel cap makes this reachable, because a panel that falls into a repetition
-// loop runs to the ceiling and stops mid-call: under a 1024-token cap 13.7% of
-// generations ended that way (36.2% on django__django-13033) against 0.5%
-// uncapped. The model also sometimes closes with </think> rather than
-// </tool_call>, so anything from the first unclosed <tool_call> onward is
-// discarded rather than trying to repair it.
-func stripUnterminatedToolCall(content string) string {
-	lower := strings.ToLower(content)
-	for search := 0; ; {
-		open := strings.Index(lower[search:], "<tool_call>")
-		if open < 0 {
-			return content
-		}
-		open += search
-		closing := strings.Index(lower[open:], "</tool_call>")
-		if closing < 0 {
-			return strings.TrimSpace(content[:open])
-		}
-		search = open + closing + len("</tool_call>")
-	}
-}
-
-// sanitizePanelContentForPrompt prepares panel output for embedding in a judge
-// prompt. An empty response stays empty; one that survives only as a truncated
-// fragment is reported as such.
-func sanitizePanelContentForPrompt(content string) string {
-	clean := strings.TrimSpace(content)
-	if clean == "" {
+// A decision that declares the shape of its final response owns that shape, so
+// the rules stand down rather than argue with it: telling a judge that calling a
+// tool is a valid turn contradicts a contract asking for one choice value, and a
+// tool call would additionally bypass contract normalization, which leaves a
+// tool-call response untouched.
+func (l *FusionLooper) fusionStageRules(req *Request, cfg fusionExecutionConfig) string {
+	if !cfg.AgenticJudgeRules {
 		return ""
 	}
-	stripped := strings.TrimSpace(stripUnterminatedToolCall(clean))
-	if stripped == "" {
-		return truncatedPanelNotice
-	}
-	return stripped
-}
-
-func formatPanelResponses(responses []*ModelResponse) string {
-	var b strings.Builder
-	for i, resp := range responses {
-		if resp == nil {
-			continue
-		}
-		fmt.Fprintf(&b, "Response %d (%s):\n%s\n\n", i+1, resp.Model, sanitizePanelContentForPrompt(resp.Content))
-		if reasoning := strings.TrimSpace(stripUnterminatedToolCall(resp.ReasoningContent)); reasoning != "" {
-			fmt.Fprintf(&b, "Reasoning %d (%s):\n%s\n\n", i+1, resp.Model, reasoning)
-		}
-	}
-	return strings.TrimSpace(b.String())
-}
-
-func formatPanelResponsesForAnalysis(responses []*ModelResponse) string {
-	var b strings.Builder
-	for i, resp := range responses {
-		if resp == nil {
-			continue
-		}
-		fmt.Fprintf(&b, "Response %d (%s):\n%s\n\n", i+1, resp.Model, normalizePanelResponseForAnalysis(resp.Content))
-	}
-	return strings.TrimSpace(b.String())
-}
-
-func normalizePanelResponseForAnalysis(content string) string {
-	clean := sanitizePanelContentForPrompt(content)
-	if clean == "" || clean == truncatedPanelNotice {
-		return clean
-	}
-	if toolName, argsJSON, ok := parseTaggedToolCall(clean); ok {
-		return fmt.Sprintf("Proposed tool call: %s\nArguments JSON: %s", toolName, strings.TrimSpace(argsJSON))
-	}
-	if !strings.Contains(clean, "<tool_call>") {
-		return clean
-	}
-	matches := fusionToolCallBlockRe.FindAllStringSubmatch(clean, -1)
-	if len(matches) == 0 {
-		return clean
-	}
-	steps := make([]string, 0, len(matches))
-	for _, match := range matches {
-		block := strings.TrimSpace(match[1])
-		if block == "" {
-			continue
-		}
-		toolName := strings.TrimSpace(fusionXMLTagRe.ReplaceAllString(strings.SplitN(block, "<arg_key>", 2)[0], ""))
-		if toolName == "" {
-			toolName = "unknown"
-		}
-		var args []string
-		for _, pair := range fusionArgPairRe.FindAllStringSubmatch(block, -1) {
-			key := strings.TrimSpace(fusionXMLTagRe.ReplaceAllString(pair[1], ""))
-			value := strings.TrimSpace(fusionXMLTagRe.ReplaceAllString(pair[2], ""))
-			if key != "" {
-				args = append(args, fmt.Sprintf("%s=%q", key, value))
-			}
-		}
-		step := fmt.Sprintf("Proposed tool call: %s", toolName)
-		if len(args) > 0 {
-			step += " (" + strings.Join(args, ", ") + ")"
-		}
-		steps = append(steps, step)
-	}
-	if len(steps) == 0 {
-		return clean
-	}
-	normalized := strings.Join(steps, "\n")
-	if idx := strings.Index(clean, "<tool_call>"); idx > 0 {
-		preamble := strings.TrimSpace(clean[:idx])
-		if preamble != "" {
-			return preamble + "\n" + normalized
-		}
-	}
-	return normalized
-}
-
-func formatFusionAnalysisForPrompt(analysis *FusionAnalysis) string {
-	if analysis == nil {
+	if outputContractConstrainsFinalShape(req.OutputContractSpec) {
+		logging.ComponentEvent("looper", "fusion_agentic_rules_suppressed", map[string]interface{}{
+			"decision":      req.DecisionName,
+			"contract_type": strings.TrimSpace(req.OutputContractSpec.Type),
+		})
 		return ""
 	}
-	data, err := json.MarshalIndent(analysis, "", "  ")
-	if err != nil {
-		return analysis.Raw
-	}
-	return string(data)
-}
-
-func parseFusionAnalysis(content string) (*FusionAnalysis, error) {
-	sanitized := sanitizeFusionAnalysisContent(content)
-	candidates := jsonObjectParseCandidates(sanitized)
-	for _, candidate := range extractBalancedJSONObjects(sanitized) {
-		candidates = appendUniqueNonEmptyString(candidates, candidate)
-	}
-	if len(candidates) == 0 {
-		return nil, fmt.Errorf("empty fusion analysis response")
-	}
-	var failures []string
-	for _, candidate := range candidates {
-		analysis, err := parseFusionAnalysisCandidate(candidate)
-		if err == nil {
-			return &analysis, nil
-		}
-		failures = append(failures, err.Error())
-	}
-	return nil, fmt.Errorf("%s", strings.Join(failures, "; "))
-}
-
-var (
-	fusionThinkBlockRe    = regexp.MustCompile(`(?is)<think>.*?</think>`)
-	fusionToolCallBlockRe = regexp.MustCompile(`(?is)<tool_call>\s*(.*?)\s*</tool_call>`)
-	fusionActionBlockRe   = regexp.MustCompile(`(?is)<\|START_ACTION\|>.*?<\|END_ACTION\|>`)
-	fusionArgPairRe       = regexp.MustCompile(`(?is)<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>`)
-	fusionXMLTagRe        = regexp.MustCompile(`(?is)<[^>]+>`)
-	fusionWordBoundaryRe  = regexp.MustCompile(`[^a-z0-9_]+`)
-)
-
-func sanitizeFusionAnalysisContent(content string) string {
-	trimmed := strings.TrimSpace(content)
-	if trimmed == "" {
-		return ""
-	}
-	withoutActionBlocks := strings.TrimSpace(fusionActionBlockRe.ReplaceAllString(trimmed, ""))
-	withoutToolCallBlocks := strings.TrimSpace(fusionToolCallBlockRe.ReplaceAllString(withoutActionBlocks, ""))
-	if idx := strings.Index(strings.ToLower(withoutToolCallBlocks), "<tool_call>"); idx >= 0 {
-		withoutToolCallBlocks = strings.TrimSpace(withoutToolCallBlocks[:idx])
-	}
-	if idx := strings.Index(strings.ToLower(withoutToolCallBlocks), "<|start_action|>"); idx >= 0 {
-		withoutToolCallBlocks = strings.TrimSpace(withoutToolCallBlocks[:idx])
-	}
-	withoutThinkBlocks := strings.TrimSpace(fusionThinkBlockRe.ReplaceAllString(withoutToolCallBlocks, ""))
-	withoutThinkBlocks = strings.ReplaceAll(withoutThinkBlocks, "</think>", "\n")
-	withoutThinkBlocks = strings.ReplaceAll(withoutThinkBlocks, "<think>", "\n")
-	return strings.TrimSpace(withoutThinkBlocks)
-}
-
-func parseFusionAnalysisCandidate(candidate string) (FusionAnalysis, error) {
-	var payload map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(candidate), &payload); err != nil {
-		return FusionAnalysis{}, err
-	}
-	_, hasConsensus := payload["consensus"]
-	_, hasContradictions := payload["contradictions"]
-	_, hasPartial := payload["partial_coverage"]
-	_, hasInsights := payload["unique_insights"]
-	_, hasBlindSpots := payload["blind_spots"]
-	if !hasConsensus && !hasContradictions && !hasPartial && !hasInsights && !hasBlindSpots {
-		return FusionAnalysis{}, fmt.Errorf("candidate is valid JSON but contains no Fusion analysis keys")
-	}
-
-	analysis := FusionAnalysis{}
-	if values, err := decodeFusionAnalysisList(payload["consensus"]); err != nil {
-		return FusionAnalysis{}, fmt.Errorf("consensus: %w", err)
-	} else {
-		analysis.Consensus = values
-	}
-	if values, err := decodeFusionAnalysisList(payload["contradictions"]); err != nil {
-		return FusionAnalysis{}, fmt.Errorf("contradictions: %w", err)
-	} else {
-		analysis.Contradictions = values
-	}
-	if values, err := decodeFusionAnalysisList(payload["partial_coverage"]); err != nil {
-		return FusionAnalysis{}, fmt.Errorf("partial_coverage: %w", err)
-	} else {
-		analysis.PartialCoverage = values
-	}
-	if values, err := decodeFusionAnalysisList(payload["unique_insights"]); err != nil {
-		return FusionAnalysis{}, fmt.Errorf("unique_insights: %w", err)
-	} else {
-		analysis.UniqueInsights = values
-	}
-	if values, err := decodeFusionAnalysisList(payload["blind_spots"]); err != nil {
-		return FusionAnalysis{}, fmt.Errorf("blind_spots: %w", err)
-	} else {
-		analysis.BlindSpots = values
-	}
-	return analysis, nil
-}
-
-func decodeFusionAnalysisList(raw json.RawMessage) ([]string, error) {
-	if len(raw) == 0 {
-		return nil, nil
-	}
-	var single string
-	if err := json.Unmarshal(raw, &single); err == nil {
-		single = strings.TrimSpace(single)
-		if single == "" {
-			return []string{}, nil
-		}
-		return []string{single}, nil
-	}
-	var list []string
-	if err := json.Unmarshal(raw, &list); err == nil {
-		return list, nil
-	}
-	var nested [][]string
-	if err := json.Unmarshal(raw, &nested); err == nil {
-		out := make([]string, 0, len(nested))
-		for _, group := range nested {
-			for _, item := range group {
-				item = strings.TrimSpace(item)
-				if item != "" {
-					out = append(out, item)
-				}
-			}
-		}
-		return out, nil
-	}
-	return nil, fmt.Errorf("expected []string or [][]string")
-}
-
-func extractBalancedJSONObjects(content string) []string {
-	objects := []string{}
-	start := -1
-	depth := 0
-	inString := false
-	escaped := false
-	for i := 0; i < len(content); i++ {
-		ch := content[i]
-		if inString {
-			if escaped {
-				escaped = false
-				continue
-			}
-			if ch == '\\' {
-				escaped = true
-				continue
-			}
-			if ch == '"' {
-				inString = false
-			}
-			continue
-		}
-		if ch == '"' {
-			inString = true
-			continue
-		}
-		if ch == '{' {
-			if depth == 0 {
-				start = i
-			}
-			depth++
-			continue
-		}
-		if ch == '}' {
-			if depth == 0 {
-				continue
-			}
-			depth--
-			if depth == 0 && start >= 0 && i >= start {
-				objects = appendUniqueNonEmptyString(objects, strings.TrimSpace(content[start:i+1]))
-				start = -1
-			}
-		}
-	}
-	return objects
+	// Affordances come off the original request; the synthesis call keeps its
+	// tools, so these are the ones the judge can actually reach for.
+	return fusionSynthesisStageRules(detectJudgeToolAffordances(req.OriginalRequest))
 }
 
 func buildFusionTrace(
@@ -1003,11 +493,11 @@ func buildFusionTrace(
 	groundingScores []groundingScore,
 ) *FusionTrace {
 	trace := &FusionTrace{
-		JudgeModel:         cfg.Model,
-		AnalysisModels:     append([]string(nil), cfg.AnalysisModels...),
-		FailedModels:       failedModels,
-		PromptVersion:      cfg.JudgePromptVersion,
-		AnalysisSkipReason: analysisSkipReason,
+		JudgeModel:          cfg.Model,
+		AnalysisModels:      append([]string(nil), cfg.AnalysisModels...),
+		FailedModels:        failedModels,
+		PromptVersion:       cfg.JudgePromptVersion,
+		AnalysisSkipReason:  analysisSkipReason,
 		AnalysisFilteredOut: analysisFilteredOut,
 	}
 	if len(groundingScores) > 0 {

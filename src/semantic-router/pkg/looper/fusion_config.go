@@ -11,6 +11,7 @@ func (l *FusionLooper) resolveFusionExecutionConfig(req *Request) fusionExecutio
 	cfg := fusionExecutionConfig{
 		IncludeAnalysis:              true,
 		IncludeIntermediateResponses: true,
+		AnalysisParseRetry:           true,
 	}
 
 	algorithmHasAnalysisModels := req.Algorithm != nil &&
@@ -91,6 +92,7 @@ func mergeFusionAlgorithmConfig(dst *fusionExecutionConfig, src *config.FusionAl
 	mergeFusionAnalysisOverrides(dst, src.AnalysisOverrides)
 	mergeFusionLimits(dst, src.MaxConcurrent, src.MaxCompletionTokens, src.RoundTimeoutSeconds, src.MinSuccessfulResponses)
 	mergeFusionControls(dst, src.Temperature, src.IncludeAnalysis, src.IncludeIntermediateResponses, src.OnError)
+	mergeFusionJudgeControls(dst, src.AnalysisParseRetry, src.SkipAnalysisOnAgreement, src.AgenticJudgeRules)
 	mergeFusionPrompts(dst, src.AnalysisTemplate, src.SynthesisTemplate, src.JudgePromptVersion)
 	mergeFusionGroundingConfig(dst, src.Grounding)
 }
@@ -146,6 +148,25 @@ func mergeFusionControls(
 	}
 }
 
+// mergeFusionJudgeControls layers the judge-behavior switches. Each is a
+// pointer so an unset field keeps the resolved default instead of forcing false.
+func mergeFusionJudgeControls(
+	dst *fusionExecutionConfig,
+	analysisParseRetry *bool,
+	skipAnalysisOnAgreement *bool,
+	agenticJudgeRules *bool,
+) {
+	if analysisParseRetry != nil {
+		dst.AnalysisParseRetry = *analysisParseRetry
+	}
+	if skipAnalysisOnAgreement != nil {
+		dst.SkipAnalysisOnAgreement = *skipAnalysisOnAgreement
+	}
+	if agenticJudgeRules != nil {
+		dst.AgenticJudgeRules = *agenticJudgeRules
+	}
+}
+
 func mergeFusionPrompts(
 	dst *fusionExecutionConfig,
 	analysisTemplate string,
@@ -181,6 +202,7 @@ func mergeFusionRequestConfig(dst *fusionExecutionConfig, src *config.FusionRequ
 	mergeFusionAnalysisOverrides(dst, src.AnalysisOverrides)
 	mergeFusionLimits(dst, src.MaxConcurrent, src.MaxCompletionTokens, src.RoundTimeoutSeconds, src.MinSuccessfulResponses)
 	mergeFusionControls(dst, src.Temperature, src.IncludeAnalysis, src.IncludeIntermediateResponses, src.OnError)
+	mergeFusionJudgeControls(dst, src.AnalysisParseRetry, src.SkipAnalysisOnAgreement, src.AgenticJudgeRules)
 	mergeFusionPrompts(dst, src.AnalysisTemplate, src.SynthesisTemplate, src.JudgePromptVersion)
 	mergeFusionGroundingConfig(dst, src.Grounding)
 }

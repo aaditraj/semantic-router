@@ -140,6 +140,20 @@ class FusionGroundingConfig(BaseModel):
     on_error: Literal["skip", "fail"] | None = "skip"
 
 
+class FusionModelOverride(BaseModel):
+    """Per-analysis-model sampling override, keyed by ``model``.
+
+    Mirrors FusionModelOverride in pkg/config/fusion_config.go. Entries merge
+    field-wise onto the decision entry for the same model.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    temperature: float | None = Field(default=None, ge=0)
+    max_completion_tokens: int | None = Field(default=None, ge=1)
+
+
 class FusionAlgorithmConfig(BaseModel):
     """Configuration for Fusion multi-model deliberation.
 
@@ -151,6 +165,7 @@ class FusionAlgorithmConfig(BaseModel):
 
     model: str | None = None
     analysis_models: list[str] | None = None
+    analysis_overrides: list[FusionModelOverride] | None = None
     max_concurrent: int | None = Field(default=None, ge=1)
     max_completion_tokens: int | None = Field(default=None, ge=1)
     round_timeout_seconds: int | None = Field(default=None, ge=1)
@@ -163,6 +178,15 @@ class FusionAlgorithmConfig(BaseModel):
     synthesis_template: str | None = None
     judge_prompt_version: str | None = "fusion-v1"
     grounding: FusionGroundingConfig | None = None
+    # Re-ask the judge once when its analysis reply cannot be parsed. Enabled by
+    # default: that path has already paid for a judge call and produced nothing.
+    analysis_parse_retry: bool | None = True
+    # Skip the analysis call when the panel proposed the same action. Off by
+    # default because it changes the model-call count and the response trace.
+    skip_analysis_on_agreement: bool | None = False
+    # Standing rules for a judge driving a tool-calling agent loop. Off by
+    # default, and ignored when output_contract_spec declares the final shape.
+    agentic_judge_rules: bool | None = False
 
 
 class WorkflowPlannerConfig(BaseModel):

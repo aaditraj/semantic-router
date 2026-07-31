@@ -134,6 +134,9 @@ algorithm:
     include_intermediate_responses: true
     on_error: skip
     judge_prompt_version: fusion-v1
+    analysis_parse_retry: true
+    skip_analysis_on_agreement: false
+    agentic_judge_rules: false
 ```
 
 Automatic routing aliases:
@@ -228,6 +231,9 @@ Request-level override:
 | `analysis_template` | string | built-in | Custom judge analysis prompt with `{{original}}` and `{{responses}}` |
 | `synthesis_template` | string | built-in | Custom final prompt with `{{original}}`, `{{responses}}`, and `{{analysis}}` |
 | `judge_prompt_version` | string | `fusion-v1` | Version marker included in Fusion response trace |
+| `analysis_parse_retry` | bool | `true` | Re-ask the judge once when its analysis reply cannot be parsed as the expected JSON |
+| `skip_analysis_on_agreement` | bool | `false` | Skip the analysis call when the panel proposed the same action |
+| `agentic_judge_rules` | bool | `false` | Add standing rules for a judge driving a tool-calling agent loop |
 | `grounding` | object | disabled | Optional grounding-aware synthesis (see below) |
 
 Best practice:
@@ -235,6 +241,35 @@ Best practice:
 - Keep `analysis_models` stable per decision, and use `analysis_overrides` for model-specific tuning.
 - Use decision-level overrides for your baseline and request-level overrides only for one-off experiments.
 - Prefer sparse request overrides (set only the field you need) to preserve decision defaults through field-wise merge.
+
+## Judge Behavior Switches
+
+Three switches control how the judge stages behave. They are independent of the
+panel and of grounding.
+
+`analysis_parse_retry` (default `true`) re-asks the judge once, naming the
+failure, when its analysis reply cannot be parsed as the five-key JSON object.
+The reply being retried has already cost a judge call and yielded nothing, so the
+default repairs it; set `false` to accept the degraded path instead, where
+synthesis proceeds from the raw panel responses.
+
+`skip_analysis_on_agreement` (default `false`) drops the analysis call when both
+panel responses proposed the same action, since there is nothing to adjudicate.
+Agreement is decided on the parsed tool calls rather than the surrounding prose:
+comparing text measures the narration, and on a SWE-bench Verified run panels
+emitting a byte-identical action read as disagreeing 49% of the time because they
+worded the explanation differently. Cosmetic arguments such as `description` are
+ignored in the comparison. Enabling this changes the model-call count and adds
+`trace.analysis_skip_reason`, which is why it is opt-in.
+
+`agentic_judge_rules` (default `false`) adds standing rules to the synthesis turn
+for a judge that is driving a tool-calling loop rather than answering a single
+question: calling a tool is a valid result for the turn, the panel cannot act so
+its silence is not evidence, keep the plan tool current, and do not claim the work
+is done without a test run made after the last edit. It applies only when the
+request actually offers the matching tools, and it stands down when
+`output_contract_spec` declares the final response shape — a decision that
+declares its output owns it, and algorithm prompt text must not compete with it.
 
 ## Grounding-Aware Synthesis
 

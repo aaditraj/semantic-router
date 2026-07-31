@@ -19,6 +19,9 @@ type judgeToolAffordances struct {
 	ShellTool string
 }
 
+// Tool names differ per agent harness, so each family lists the names seen in
+// practice rather than one canonical name. A harness whose tools are missing
+// here loses the matching rule, not the whole set.
 var (
 	judgePlanToolNames  = []string{"todowrite", "todoread", "todo", "update_plan", "plan"}
 	judgeShellToolNames = []string{"bash", "shell", "run_terminal_cmd", "terminal", "execute"}
@@ -58,35 +61,38 @@ func requestToolNames(req *openai.ChatCompletionNewParams) []string {
 	var names []string
 	if tools, ok := reqMap["tools"].([]interface{}); ok {
 		for _, rawTool := range tools {
-			tool, ok := rawTool.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			fn, ok := tool["function"].(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if name, ok := fn["name"].(string); ok && name != "" {
-				names = append(names, name)
-			}
+			names = appendToolName(names, nestedToolFunction(rawTool))
 		}
 	}
 	if functions, ok := reqMap["functions"].([]interface{}); ok {
 		for _, rawFn := range functions {
-			fn, ok := rawFn.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if name, ok := fn["name"].(string); ok && name != "" {
-				names = append(names, name)
-			}
+			fn, _ := rawFn.(map[string]interface{})
+			names = appendToolName(names, fn)
 		}
 	}
 	return names
 }
 
+func nestedToolFunction(rawTool interface{}) map[string]interface{} {
+	tool, ok := rawTool.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	fn, _ := tool["function"].(map[string]interface{})
+	return fn
+}
+
+func appendToolName(names []string, fn map[string]interface{}) []string {
+	if name, ok := fn["name"].(string); ok && name != "" {
+		return append(names, name)
+	}
+	return names
+}
+
 // fusionSynthesisStageRules returns the standing rules for a judge that is
-// driving an agent loop rather than answering a single question.
+// driving an agent loop rather than answering a single question. Callers gate
+// this on algorithm.fusion.agentic_judge_rules; it is off by default because a
+// judge answering a single question needs none of it.
 //
 // Two behaviours motivated these, measured against single-endpoint runs using
 // the same agent and dataset on SWE-bench Verified:
@@ -115,7 +121,7 @@ func fusionSynthesisStageRules(aff judgeToolAffordances) string {
 	}
 	if aff.ShellTool != "" {
 		rules = append(rules,
-			"- Do not state that the work is complete, cor rect, or verified unless this conversation already shows a test run made after the most recent edit whose output passed. Panel agreement is not evidence of correctness; only observed test output is.",
+			"- Do not state that the work is complete, correct, or verified unless this conversation already shows a test run made after the most recent edit whose output passed. Panel agreement is not evidence of correctness; only observed test output is.",
 			fmt.Sprintf(
 				"- When that evidence is missing, spend this turn running the relevant tests with `%s` rather than declaring completion.",
 				aff.ShellTool,
