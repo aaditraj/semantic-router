@@ -39,6 +39,9 @@ func normalizeFusionExecutionConfig(cfg fusionExecutionConfig) fusionExecutionCo
 	if cfg.JudgePromptVersion == "" {
 		cfg.JudgePromptVersion = config.DefaultFusionJudgePromptVersion
 	}
+	if cfg.AnalysisInstructionMode == "" {
+		cfg.AnalysisInstructionMode = config.FusionAnalysisInstructionUser
+	}
 	cfg.AnalysisModels = normalizeModelNames(cfg.AnalysisModels)
 	cfg.AnalysisOverrides = normalizeFusionAnalysisOverrides(cfg.AnalysisModels, cfg.AnalysisOverrides)
 	if cfg.MaxConcurrent <= 0 || cfg.MaxConcurrent > len(cfg.AnalysisModels) {
@@ -90,7 +93,7 @@ func mergeFusionAlgorithmConfig(dst *fusionExecutionConfig, src *config.FusionAl
 	mergeFusionModels(dst, src.Model, src.AnalysisModels)
 	mergeFusionAnalysisOverrides(dst, src.AnalysisOverrides)
 	mergeFusionLimits(dst, src.MaxConcurrent, src.MaxCompletionTokens, src.RoundTimeoutSeconds, src.MinSuccessfulResponses)
-	mergeFusionControls(dst, src.Temperature, src.IncludeAnalysis, src.IncludeIntermediateResponses, src.EnforceAnalysisJSON, src.OnError)
+	mergeFusionControls(dst, src.Temperature, src.IncludeAnalysis, src.IncludeIntermediateResponses, src.EnforceAnalysisJSON, src.AnalysisInstructionMode, src.OnError)
 	mergeFusionPrompts(dst, src.AnalysisTemplate, src.SynthesisTemplate, src.JudgePromptVersion)
 	mergeFusionGroundingConfig(dst, src.Grounding)
 }
@@ -131,6 +134,7 @@ func mergeFusionControls(
 	includeAnalysis *bool,
 	includeIntermediateResponses *bool,
 	enforceAnalysisJSON *bool,
+	analysisInstructionMode string,
 	onError string,
 ) {
 	if temperature != nil {
@@ -144,6 +148,9 @@ func mergeFusionControls(
 	}
 	if enforceAnalysisJSON != nil {
 		dst.EnforceAnalysisJSON = *enforceAnalysisJSON
+	}
+	if analysisInstructionMode != "" {
+		dst.AnalysisInstructionMode = analysisInstructionMode
 	}
 	if onError != "" {
 		dst.OnError = onError
@@ -184,7 +191,7 @@ func mergeFusionRequestConfig(dst *fusionExecutionConfig, src *config.FusionRequ
 	mergeFusionModels(dst, src.Model, src.AnalysisModels)
 	mergeFusionAnalysisOverrides(dst, src.AnalysisOverrides)
 	mergeFusionLimits(dst, src.MaxConcurrent, src.MaxCompletionTokens, src.RoundTimeoutSeconds, src.MinSuccessfulResponses)
-	mergeFusionControls(dst, src.Temperature, src.IncludeAnalysis, src.IncludeIntermediateResponses, src.EnforceAnalysisJSON, src.OnError)
+	mergeFusionControls(dst, src.Temperature, src.IncludeAnalysis, src.IncludeIntermediateResponses, src.EnforceAnalysisJSON, src.AnalysisInstructionMode, src.OnError)
 	mergeFusionPrompts(dst, src.AnalysisTemplate, src.SynthesisTemplate, src.JudgePromptVersion)
 	mergeFusionGroundingConfig(dst, src.Grounding)
 }

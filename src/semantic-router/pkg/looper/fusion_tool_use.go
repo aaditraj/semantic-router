@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/openai/openai-go"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 )
 
 const fusionAnalysisStageInstruction = "You are the Fusion analysis judge. Output exactly one valid JSON object with only these keys: consensus, contradictions, partial_coverage, unique_insights, blind_spots. Do not call tools. Do not emit markdown, XML tags, or extra prose."
@@ -53,9 +54,10 @@ func appendFusionStageMessage(req *openai.ChatCompletionNewParams, content strin
 	return &appended
 }
 
-// buildFusionAnalysisStageRequest appends the analysis judge's system
-// instruction and prompt to the conversation, leaving the existing turns
-// untouched.
+// buildFusionAnalysisStageRequest appends the analysis judge instruction and prompt
+// to the conversation, leaving the existing turns untouched. System mode keeps
+// the instruction and analysis data in separate messages; user mode combines them
+// for backends that require system messages to appear first.
 //
 // The history must be extended, never rewritten. vLLM's prefix cache keys on
 // the longest common *prefix* of the token sequence, so deleting a message in
@@ -66,7 +68,7 @@ func appendFusionStageMessage(req *openai.ChatCompletionNewParams, content strin
 // prefix reuse from 99.9% to 17% and evicted the shared prefix the other stages
 // depend on, while removing only ~7% of the context (OpenCode's assistant
 // messages carry tool_calls, not text).
-func buildFusionAnalysisStageRequest(req *openai.ChatCompletionNewParams, content string) *openai.ChatCompletionNewParams {
+func buildFusionAnalysisStageRequest(req *openai.ChatCompletionNewParams, content string, instructionMode string) *openai.ChatCompletionNewParams {
 	if req == nil {
 		return nil
 	}
@@ -84,10 +86,21 @@ func buildFusionAnalysisStageRequest(req *openai.ChatCompletionNewParams, conten
 	}
 	extended := make([]interface{}, 0, len(messages)+2)
 	extended = append(extended, messages...)
-	extended = append(extended, map[string]string{
-		"role":    "user",
-		"content": fusionAnalysisStageInstruction + "\n\n" + content,
-	})
+	if instructionMode == config.FusionAnalysisInstructionSystem {
+		extended = append(extended, map[string]string{
+			"role":    "system",
+			"content": fusionAnalysisStageInstruction,
+		})
+		extended = append(extended, map[string]string{
+			"role":    "user",
+			"content": content,
+		})
+	} else {
+		extended = append(extended, map[string]string{
+			"role":    "user",
+			"content": fusionAnalysisStageInstruction + "\n\n" + content,
+		})
+	}
 	reqMap["messages"] = extended
 	data, err = json.Marshal(reqMap)
 	if err != nil {

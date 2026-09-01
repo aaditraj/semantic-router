@@ -37,6 +37,7 @@ type fusionExecutionConfig struct {
 	IncludeAnalysis              bool
 	IncludeIntermediateResponses bool
 	EnforceAnalysisJSON          bool
+	AnalysisInstructionMode      string
 	OnError                      string
 	AnalysisTemplate             string
 	SynthesisTemplate            string
@@ -351,7 +352,7 @@ func (l *FusionLooper) runFusionAnalysis(
 	if notes := formatGroundingNotes(groundingScores); notes != "" {
 		prompt = prompt + "\n\n" + notes
 	}
-	analysisReq := buildFusionAnalysisStageRequest(req.OriginalRequest, prompt)
+	analysisReq := buildFusionAnalysisStageRequest(req.OriginalRequest, prompt, cfg.AnalysisInstructionMode)
 	analysisReq = stripFusionToolUse(analysisReq)
 	resp, err := l.callFusionModel(ctx, &Request{OriginalRequest: analysisReq, ModelParams: req.ModelParams}, cfg, cfg.Model, false, false, len(panelResponses)+1, "analysis", config.FusionModelOverride{})
 	if err != nil {
@@ -367,7 +368,7 @@ func (l *FusionLooper) runFusionAnalysis(
 			"Your previous response was invalid for parsing.\n" +
 			"Return ONLY one valid JSON object matching the exact schema keys.\n" +
 			"No prose. No markdown. No tool calls. No XML tags."
-		retryReq := buildFusionAnalysisStageRequest(req.OriginalRequest, retryPrompt)
+		retryReq := buildFusionAnalysisStageRequest(req.OriginalRequest, retryPrompt, cfg.AnalysisInstructionMode)
 		retryReq = stripFusionToolUse(retryReq)
 		retryResp, retryErr := l.callFusionModel(ctx, &Request{OriginalRequest: retryReq, ModelParams: req.ModelParams}, cfg, cfg.Model, false, false, len(panelResponses)+1, "analysis_retry", config.FusionModelOverride{})
 		if retryErr == nil && retryResp != nil {

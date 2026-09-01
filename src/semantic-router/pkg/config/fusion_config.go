@@ -9,6 +9,8 @@ const (
 	DefaultFusionModelName          = "vllm-sr/fusion"
 	OpenRouterFusionModelAlias      = "openrouter/fusion"
 	DefaultFusionJudgePromptVersion = "fusion-v1"
+	FusionAnalysisInstructionUser   = "user"
+	FusionAnalysisInstructionSystem = "system"
 	FusionOnErrorSkip               = "skip"
 	FusionOnErrorFail               = "fail"
 
@@ -45,6 +47,7 @@ type FusionAlgorithmConfig struct {
 	Temperature                  *float64               `yaml:"temperature,omitempty" json:"temperature,omitempty"`
 	IncludeAnalysis              *bool                  `yaml:"include_analysis,omitempty" json:"include_analysis,omitempty"`
 	EnforceAnalysisJSON          *bool                  `yaml:"enforce_analysis_json,omitempty" json:"enforce_analysis_json,omitempty"`
+	AnalysisInstructionMode      string                 `yaml:"analysis_instruction_mode,omitempty" json:"analysis_instruction_mode,omitempty"`
 	OnError                      string                 `yaml:"on_error,omitempty" json:"on_error,omitempty"`
 	AnalysisTemplate             string                 `yaml:"analysis_template,omitempty" json:"analysis_template,omitempty"`
 	SynthesisTemplate            string                 `yaml:"synthesis_template,omitempty" json:"synthesis_template,omitempty"`
@@ -89,6 +92,7 @@ type FusionRequestConfig struct {
 	Temperature                  *float64               `json:"temperature,omitempty" yaml:"temperature,omitempty"`
 	IncludeAnalysis              *bool                  `json:"include_analysis,omitempty" yaml:"include_analysis,omitempty"`
 	EnforceAnalysisJSON          *bool                  `json:"enforce_analysis_json,omitempty" yaml:"enforce_analysis_json,omitempty"`
+	AnalysisInstructionMode      string                 `json:"analysis_instruction_mode,omitempty" yaml:"analysis_instruction_mode,omitempty"`
 	IncludeIntermediateResponses *bool                  `json:"include_intermediate_responses,omitempty" yaml:"include_intermediate_responses,omitempty"`
 	OnError                      string                 `json:"on_error,omitempty" yaml:"on_error,omitempty"`
 	AnalysisTemplate             string                 `json:"analysis_template,omitempty" yaml:"analysis_template,omitempty"`
@@ -172,6 +176,9 @@ func ValidateFusionAlgorithmConfig(cfg *FusionAlgorithmConfig) error {
 		return nil
 	}
 	if err := validateFusionOnError(cfg.OnError); err != nil {
+		return err
+	}
+	if err := ValidateFusionAnalysisInstructionMode(cfg.AnalysisInstructionMode); err != nil {
 		return err
 	}
 	if cfg.MaxConcurrent < 0 {
@@ -287,6 +294,13 @@ func validateFusionModelOverrides(overrides []FusionModelOverride) error {
 		}
 	}
 	return nil
+}
+
+func ValidateFusionAnalysisInstructionMode(mode string) error {
+	if strings.TrimSpace(mode) == "" || mode == FusionAnalysisInstructionUser || mode == FusionAnalysisInstructionSystem {
+		return nil
+	}
+	return fmt.Errorf("analysis_instruction_mode must be %q or %q, got %q", FusionAnalysisInstructionUser, FusionAnalysisInstructionSystem, mode)
 }
 
 func validateFusionOnError(onError string) error {

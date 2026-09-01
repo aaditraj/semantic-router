@@ -827,6 +827,7 @@ routing:
           include_analysis: true
           include_intermediate_responses: true
           enforce_analysis_json: false
+          analysis_instruction_mode: user
           on_error: skip
           analysis_template: ""
           synthesis_template: ""

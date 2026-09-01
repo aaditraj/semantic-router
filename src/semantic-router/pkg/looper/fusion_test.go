@@ -646,6 +646,20 @@ func TestNormalizePanelResponseForAnalysisPreservesPreambleBeforeToolCall(t *tes
 // The analysis stage must EXTEND the conversation, never rewrite it: rewriting
 // diverges from the token prefix the panel and synthesis calls share, which
 // costs a full re-prefill on every turn.
+func TestBuildFusionAnalysisStageRequestSupportsSystemInstructionMode(t *testing.T) {
+	params := openai.ChatCompletionNewParams{Messages: []openai.ChatCompletionMessageParamUnion{openai.UserMessage("u1")}}
+	prepared := buildFusionAnalysisStageRequest(&params, "analysis prompt", config.FusionAnalysisInstructionSystem)
+	raw, err := json.Marshal(prepared)
+	require.NoError(t, err)
+	var payload map[string]interface{}
+	require.NoError(t, json.Unmarshal(raw, &payload))
+	msgs := payload["messages"].([]interface{})
+	assert.Equal(t, "system", msgs[1].(map[string]interface{})["role"])
+	assert.Equal(t, fusionAnalysisStageInstruction, msgs[1].(map[string]interface{})["content"])
+	assert.Equal(t, "user", msgs[2].(map[string]interface{})["role"])
+	assert.Equal(t, "analysis prompt", msgs[2].(map[string]interface{})["content"])
+}
+
 func TestBuildFusionAnalysisStageRequestExtendsHistoryWithoutRewritingIt(t *testing.T) {
 	params := openai.ChatCompletionNewParams{
 		Model: "vllm-sr/fusion",
@@ -658,7 +672,7 @@ func TestBuildFusionAnalysisStageRequestExtendsHistoryWithoutRewritingIt(t *test
 		},
 	}
 
-	prepared := buildFusionAnalysisStageRequest(&params, "analysis prompt")
+	prepared := buildFusionAnalysisStageRequest(&params, "analysis prompt", config.FusionAnalysisInstructionUser)
 	require.NotNil(t, prepared)
 
 	raw, err := json.Marshal(prepared)
