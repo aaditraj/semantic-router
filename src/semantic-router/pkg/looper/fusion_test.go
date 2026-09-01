@@ -174,6 +174,41 @@ func TestMergeFusionRequestConfigCoversAdvancedOptions(t *testing.T) {
 	assert.Equal(t, config.FusionOnErrorFail, dst.GroundingOnError)
 }
 
+func TestResolveFusionExecutionConfigLayersAnalysisOverridesFieldWise(t *testing.T) {
+	looper := NewFusionLooper(&config.LooperConfig{Endpoint: "http://looper"})
+	req := newFusionTestRequest()
+	req.Algorithm = &config.AlgorithmConfig{
+		Type: "fusion",
+		Fusion: &config.FusionAlgorithmConfig{
+			Model:          "judge",
+			AnalysisModels: []string{"panel-a", "panel-b"},
+			AnalysisOverrides: []config.FusionModelOverride{
+				{Model: "panel-a", Temperature: float64Ptr(0.2), MaxCompletionTokens: 512},
+				{Model: "panel-b", Temperature: float64Ptr(0.8)},
+			},
+		},
+	}
+	req.Fusion = &config.FusionRequestConfig{
+		ID: "fusion",
+		AnalysisOverrides: []config.FusionModelOverride{
+			{Model: "panel-a", MaxCompletionTokens: 100},
+			{Model: "panel-b", Temperature: float64Ptr(0.1)},
+		},
+	}
+
+	cfg := looper.resolveFusionExecutionConfig(req)
+
+	require.Len(t, cfg.AnalysisOverrides, 2)
+	panelA := cfg.AnalysisOverrides["panel-a"]
+	require.NotNil(t, panelA.Temperature)
+	assert.Equal(t, 0.2, *panelA.Temperature)
+	assert.Equal(t, 100, panelA.MaxCompletionTokens)
+	panelB := cfg.AnalysisOverrides["panel-b"]
+	require.NotNil(t, panelB.Temperature)
+	assert.Equal(t, 0.1, *panelB.Temperature)
+	assert.Zero(t, panelB.MaxCompletionTokens)
+}
+
 func TestFusionLooperAppliesPerAnalysisOverrides(t *testing.T) {
 	type callParams struct {
 		temperature         *float64
@@ -633,7 +668,7 @@ func TestBuildFusionAnalysisStageRequestExtendsHistoryWithoutRewritingIt(t *test
 
 	msgs, ok := payload["messages"].([]interface{})
 	require.True(t, ok)
-	require.Len(t, msgs, 7)
+	require.Len(t, msgs, 6)
 
 	var roles []string
 	var contents []string
@@ -644,10 +679,10 @@ func TestBuildFusionAnalysisStageRequestExtendsHistoryWithoutRewritingIt(t *test
 			contents = append(contents, c)
 		}
 	}
-	assert.Equal(t, []string{"user", "assistant", "user", "assistant", "user", "system", "user"}, roles)
+	assert.Equal(t, []string{"user", "assistant", "user", "assistant", "user", "user"}, roles)
 	assert.Equal(
 		t,
-		[]string{"u1", "a1", "u2", "a2", "u3", fusionAnalysisStageSystemPrompt, "analysis prompt"},
+		[]string{"u1", "a1", "u2", "a2", "u3", fusionAnalysisStageInstruction + "\n\nanalysis prompt"},
 		contents,
 	)
 }
@@ -710,6 +745,18 @@ func TestNormalizePanelResponseForAnalysisHandlesTruncation(t *testing.T) {
 	assert.Equal(t, "just prose", normalizePanelResponseForAnalysis("just prose"))
 }
 
+func TestFormatPanelResponsesForAnalysisIncludesSanitizedReasoning(t *testing.T) {
+	responses := []*ModelResponse{
+		{Model: "muse-glimmer", ReasoningContent: "inspect compiler.py\n<tool_call>read<arg_key>path</arg_key><arg_value>/testbed/compiler.py</arg_value></tool_call>"},
+	}
+
+	out := formatPanelResponsesForAnalysis(responses)
+
+	assert.Contains(t, out, "Reasoning 1 (muse-glimmer):")
+	assert.Contains(t, out, "Proposed tool call: read")
+	assert.NotContains(t, out, "<tool_call>")
+}
+
 func TestAppendFusionStageMessageDoesNotInjectAnalysisSystemPrompt(t *testing.T) {
 	params := openai.ChatCompletionNewParams{
 		Model: "vllm-sr/fusion",
@@ -737,7 +784,7 @@ func TestAppendFusionStageMessageDoesNotInjectAnalysisSystemPrompt(t *testing.T)
 	for _, m := range msgs {
 		msg := m.(map[string]interface{})
 		content, _ := msg["content"].(string)
-		assert.NotEqual(t, fusionAnalysisStageSystemPrompt, content)
+		assert.NotEqual(t, fusionAnalysisStageInstruction, content)
 	}
 }
 

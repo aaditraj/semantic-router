@@ -145,6 +145,10 @@ type LogprobsConfig struct {
 //   - logprobsCfg: controls whether to enable logprobs and top_logprobs (nil = disabled)
 //   - accessKey: optional API key for Authorization header (Bearer token)
 func (c *Client) CallModel(ctx context.Context, req *openai.ChatCompletionNewParams, modelName string, streaming bool, iteration int, logprobsCfg *LogprobsConfig, accessKey string) (*ModelResponse, error) {
+	return c.CallModelWithStage(ctx, req, modelName, streaming, iteration, logprobsCfg, accessKey, "model")
+}
+
+func (c *Client) CallModelWithStage(ctx context.Context, req *openai.ChatCompletionNewParams, modelName string, streaming bool, iteration int, logprobsCfg *LogprobsConfig, accessKey string, stage string) (*ModelResponse, error) {
 	// Clone and modify the request with the target model
 	modifiedReq := cloneRequest(req)
 	modifiedReq.Model = modelName
@@ -183,6 +187,7 @@ func (c *Client) CallModel(ctx context.Context, req *openai.ChatCompletionNewPar
 		"streaming": streaming,
 		"iteration": iteration,
 		"logprobs":  logprobsEnabled,
+		"stage":     stage,
 	})
 
 	// Create HTTP request
@@ -219,12 +224,32 @@ func (c *Client) CallModel(ctx context.Context, req *openai.ChatCompletionNewPar
 	start := time.Now()
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
+		latencyMs := time.Since(start).Milliseconds()
+		logging.ComponentWarnEvent("looper", "model_call_failed", map[string]interface{}{
+			"decision":   c.decisionName,
+			"model_ref":  modelName,
+			"iteration":  iteration,
+			"streaming":  streaming,
+			"stage":      stage,
+			"latency_ms": latencyMs,
+			"error":      err.Error(),
+		})
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := c.readResponseBody(resp)
 	if err != nil {
+		logging.ComponentWarnEvent("looper", "model_call_failed", map[string]interface{}{
+			"decision":    c.decisionName,
+			"model_ref":   modelName,
+			"iteration":   iteration,
+			"streaming":   streaming,
+			"stage":       stage,
+			"latency_ms":  time.Since(start).Milliseconds(),
+			"status_code": resp.StatusCode,
+			"error":       err.Error(),
+		})
 		return nil, err
 	}
 
@@ -236,9 +261,35 @@ func (c *Client) CallModel(ctx context.Context, req *openai.ChatCompletionNewPar
 		result, err = c.parseNonStreamingResponse(respBody, modelName)
 	}
 	if err != nil {
-		return nil, err
+		logging.ComponentWarnEvent("looper", "model_call_failed", map[string]interface{}{
+			"decision":    c.decisionName,
+			"model_ref":   modelName,
+			"iteration":   iteration,
+			"streaming":   streaming,
+			"stage":       stage,
+			"latency_ms":  time.Since(start).Milliseconds(),
+			"status_code": resp.StatusCode,
+			"error":       err.Error(),
+		})
+		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 	result.LatencyMs = time.Since(start).Milliseconds()
+
+	logging.ComponentEvent("looper", "model_call_completed", map[string]interface{}{
+		"decision":          c.decisionName,
+		"model_ref":         modelName,
+		"iteration":         iteration,
+		"streaming":         streaming,
+		"stage":             stage,
+		"latency_ms":        result.LatencyMs,
+		"status_code":       resp.StatusCode,
+		"content_len":       len(result.Content),
+		"reasoning_len":     len(result.ReasoningContent),
+		"has_tool_calls":    result.HasToolCalls,
+		"prompt_tokens":     result.Usage.PromptTokens,
+		"completion_tokens": result.Usage.CompletionTokens,
+		"total_tokens":      result.Usage.TotalTokens,
+	})
 	return result, nil
 }
 

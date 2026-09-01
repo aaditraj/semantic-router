@@ -7,7 +7,7 @@ import (
 	"github.com/openai/openai-go"
 )
 
-const fusionAnalysisStageSystemPrompt = "You are the Fusion analysis judge. Output exactly one valid JSON object with only these keys: consensus, contradictions, partial_coverage, unique_insights, blind_spots. Do not call tools. Do not emit markdown, XML tags, or extra prose."
+const fusionAnalysisStageInstruction = "You are the Fusion analysis judge. Output exactly one valid JSON object with only these keys: consensus, contradictions, partial_coverage, unique_insights, blind_spots. Do not call tools. Do not emit markdown, XML tags, or extra prose."
 
 func stripFusionToolUse(req *openai.ChatCompletionNewParams) *openai.ChatCompletionNewParams {
 	if req == nil {
@@ -85,12 +85,8 @@ func buildFusionAnalysisStageRequest(req *openai.ChatCompletionNewParams, conten
 	extended := make([]interface{}, 0, len(messages)+2)
 	extended = append(extended, messages...)
 	extended = append(extended, map[string]string{
-		"role":    "system",
-		"content": fusionAnalysisStageSystemPrompt,
-	})
-	extended = append(extended, map[string]string{
 		"role":    "user",
-		"content": content,
+		"content": fusionAnalysisStageInstruction + "\n\n" + content,
 	})
 	reqMap["messages"] = extended
 	data, err = json.Marshal(reqMap)

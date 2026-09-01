@@ -90,7 +90,7 @@ func mergeFusionAlgorithmConfig(dst *fusionExecutionConfig, src *config.FusionAl
 	mergeFusionModels(dst, src.Model, src.AnalysisModels)
 	mergeFusionAnalysisOverrides(dst, src.AnalysisOverrides)
 	mergeFusionLimits(dst, src.MaxConcurrent, src.MaxCompletionTokens, src.RoundTimeoutSeconds, src.MinSuccessfulResponses)
-	mergeFusionControls(dst, src.Temperature, src.IncludeAnalysis, src.IncludeIntermediateResponses, src.OnError)
+	mergeFusionControls(dst, src.Temperature, src.IncludeAnalysis, src.IncludeIntermediateResponses, src.EnforceAnalysisJSON, src.OnError)
 	mergeFusionPrompts(dst, src.AnalysisTemplate, src.SynthesisTemplate, src.JudgePromptVersion)
 	mergeFusionGroundingConfig(dst, src.Grounding)
 }
@@ -130,6 +130,7 @@ func mergeFusionControls(
 	temperature *float64,
 	includeAnalysis *bool,
 	includeIntermediateResponses *bool,
+	enforceAnalysisJSON *bool,
 	onError string,
 ) {
 	if temperature != nil {
@@ -140,6 +141,9 @@ func mergeFusionControls(
 	}
 	if includeIntermediateResponses != nil {
 		dst.IncludeIntermediateResponses = *includeIntermediateResponses
+	}
+	if enforceAnalysisJSON != nil {
+		dst.EnforceAnalysisJSON = *enforceAnalysisJSON
 	}
 	if onError != "" {
 		dst.OnError = onError
@@ -180,7 +184,7 @@ func mergeFusionRequestConfig(dst *fusionExecutionConfig, src *config.FusionRequ
 	mergeFusionModels(dst, src.Model, src.AnalysisModels)
 	mergeFusionAnalysisOverrides(dst, src.AnalysisOverrides)
 	mergeFusionLimits(dst, src.MaxConcurrent, src.MaxCompletionTokens, src.RoundTimeoutSeconds, src.MinSuccessfulResponses)
-	mergeFusionControls(dst, src.Temperature, src.IncludeAnalysis, src.IncludeIntermediateResponses, src.OnError)
+	mergeFusionControls(dst, src.Temperature, src.IncludeAnalysis, src.IncludeIntermediateResponses, src.EnforceAnalysisJSON, src.OnError)
 	mergeFusionPrompts(dst, src.AnalysisTemplate, src.SynthesisTemplate, src.JudgePromptVersion)
 	mergeFusionGroundingConfig(dst, src.Grounding)
 }
@@ -227,8 +231,15 @@ func mergeFusionAnalysisOverrides(dst *fusionExecutionConfig, overrides []config
 		if name == "" {
 			continue
 		}
-		override.Model = name
-		dst.AnalysisOverrides[name] = override
+		merged := dst.AnalysisOverrides[name]
+		merged.Model = name
+		if override.Temperature != nil {
+			merged.Temperature = override.Temperature
+		}
+		if override.MaxCompletionTokens > 0 {
+			merged.MaxCompletionTokens = override.MaxCompletionTokens
+		}
+		dst.AnalysisOverrides[name] = merged
 	}
 }
 

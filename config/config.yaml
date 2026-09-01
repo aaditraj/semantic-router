@@ -826,6 +826,7 @@ routing:
           temperature: 0.2
           include_analysis: true
           include_intermediate_responses: true
+          enforce_analysis_json: false
           on_error: skip
           analysis_template: ""
           synthesis_template: ""

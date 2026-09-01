@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/shared"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
@@ -35,6 +36,7 @@ type fusionExecutionConfig struct {
 	Temperature                  *float64
 	IncludeAnalysis              bool
 	IncludeIntermediateResponses bool
+	EnforceAnalysisJSON          bool
 	OnError                      string
 	AnalysisTemplate             string
 	SynthesisTemplate            string
@@ -191,7 +193,7 @@ func (l *FusionLooper) executeFusionPanel(
 				return
 			}
 			defer func() { <-sem }()
-			resp, err := l.callFusionModel(panelCtx, req, cfg, modelName, false, false, index+1, cfg.AnalysisOverrides[modelName])
+			resp, err := l.callFusionModel(panelCtx, req, cfg, modelName, false, false, index+1, "panel", cfg.AnalysisOverrides[modelName])
 			results <- fusionPanelResult{index: index, model: modelName, resp: resp, err: err}
 		}(i, model)
 	}
@@ -293,9 +295,18 @@ func (l *FusionLooper) callFusionModel(
 	allowTools bool,
 	streaming bool,
 	iteration int,
+	stage string,
 	override config.FusionModelOverride,
 ) (*ModelResponse, error) {
 	callReq := cloneRequest(req.OriginalRequest)
+	if cfg.EnforceAnalysisJSON && (stage == "analysis" || stage == "analysis_retry") {
+		callReq.ResponseFormat = openai.ChatCompletionNewParamsResponseFormatUnion{
+			OfJSONObject: func() *shared.ResponseFormatJSONObjectParam {
+				format := shared.NewResponseFormatJSONObjectParam()
+				return &format
+			}(),
+		}
+	}
 	if !allowTools {
 		callReq = stripFusionToolUse(callReq)
 	}
@@ -309,7 +320,7 @@ func (l *FusionLooper) callFusionModel(
 	} else if cfg.MaxCompletionTokens > 0 {
 		callReq.MaxCompletionTokens = openai.Int(int64(cfg.MaxCompletionTokens))
 	}
-	return l.client.CallModel(ctx, callReq, modelName, streaming, iteration, nil, accessKeyForModel(req, modelName))
+	return l.client.CallModelWithStage(ctx, callReq, modelName, streaming, iteration, nil, accessKeyForModel(req, modelName), stage)
 }
 
 func accessKeyForModel(req *Request, modelName string) string {
@@ -342,7 +353,7 @@ func (l *FusionLooper) runFusionAnalysis(
 	}
 	analysisReq := buildFusionAnalysisStageRequest(req.OriginalRequest, prompt)
 	analysisReq = stripFusionToolUse(analysisReq)
-	resp, err := l.callFusionModel(ctx, &Request{OriginalRequest: analysisReq, ModelParams: req.ModelParams}, cfg, cfg.Model, false, false, len(panelResponses)+1, config.FusionModelOverride{})
+	resp, err := l.callFusionModel(ctx, &Request{OriginalRequest: analysisReq, ModelParams: req.ModelParams}, cfg, cfg.Model, false, false, len(panelResponses)+1, "analysis", config.FusionModelOverride{})
 	if err != nil {
 		logging.ComponentWarnEvent("looper", "fusion_analysis_failed", map[string]interface{}{
 			"judge_model": cfg.Model,
@@ -358,7 +369,7 @@ func (l *FusionLooper) runFusionAnalysis(
 			"No prose. No markdown. No tool calls. No XML tags."
 		retryReq := buildFusionAnalysisStageRequest(req.OriginalRequest, retryPrompt)
 		retryReq = stripFusionToolUse(retryReq)
-		retryResp, retryErr := l.callFusionModel(ctx, &Request{OriginalRequest: retryReq, ModelParams: req.ModelParams}, cfg, cfg.Model, false, false, len(panelResponses)+1, config.FusionModelOverride{})
+		retryResp, retryErr := l.callFusionModel(ctx, &Request{OriginalRequest: retryReq, ModelParams: req.ModelParams}, cfg, cfg.Model, false, false, len(panelResponses)+1, "analysis_retry", config.FusionModelOverride{})
 		if retryErr == nil && retryResp != nil {
 			if recovered, recoveredErr := parseFusionAnalysis(retryResp.Content); recoveredErr == nil {
 				logging.ComponentEvent("looper", "fusion_analysis_parse_recovered", map[string]interface{}{
@@ -394,7 +405,7 @@ func (l *FusionLooper) runFusionFinal(
 		prompt = prompt + "\n\n" + notes
 	}
 	finalReq := appendFusionStageMessage(req.OriginalRequest, prompt)
-	resp, err := l.callFusionModel(ctx, &Request{OriginalRequest: finalReq, ModelParams: req.ModelParams}, cfg, cfg.Model, true, false, len(panelResponses)+2, config.FusionModelOverride{})
+	resp, err := l.callFusionModel(ctx, &Request{OriginalRequest: finalReq, ModelParams: req.ModelParams}, cfg, cfg.Model, true, false, len(panelResponses)+2, "final", config.FusionModelOverride{})
 	if err != nil {
 		return nil, fmt.Errorf("fusion final synthesis failed for judge model %q: %w", cfg.Model, err)
 	}
@@ -545,6 +556,9 @@ func formatPanelResponsesForAnalysis(responses []*ModelResponse) string {
 			continue
 		}
 		fmt.Fprintf(&b, "Response %d (%s):\n%s\n\n", i+1, resp.Model, normalizePanelResponseForAnalysis(resp.Content))
+		if reasoning := normalizePanelResponseForAnalysis(resp.ReasoningContent); reasoning != "" {
+			fmt.Fprintf(&b, "Reasoning %d (%s):\n%s\n\n", i+1, resp.Model, reasoning)
+		}
 	}
 	return strings.TrimSpace(b.String())
 }

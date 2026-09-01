@@ -503,6 +503,23 @@ func requestsReferenceSelection(spec *config.OutputContractSpec) bool {
 	return spec != nil && strings.TrimSpace(spec.Type) == config.OutputContractTypeReferenceSelect
 }
 
+// outputContractConstrainsFinalShape reports whether the decision declares what
+// the final response must look like. Algorithm-level prompt text must not
+// compete with a declared shape, so callers use this to stand down.
+func outputContractConstrainsFinalShape(spec *config.OutputContractSpec) bool {
+	if spec == nil {
+		return false
+	}
+	switch strings.TrimSpace(spec.Type) {
+	case config.OutputContractTypeChoice,
+		config.OutputContractTypeStructuredJSON,
+		config.OutputContractTypeReferenceSelect:
+		return true
+	default:
+		return false
+	}
+}
+
 func extractSingleChoiceAnswerFromResponse(resp *ModelResponse, spec *config.OutputContractSpec) (string, bool) {
 	for _, source := range outputContractExtractSources(spec) {
 		content, ok := responseContentForOutputContractSource(resp, source)

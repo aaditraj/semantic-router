@@ -44,6 +44,7 @@ type FusionAlgorithmConfig struct {
 	MinSuccessfulResponses       int                    `yaml:"min_successful_responses,omitempty" json:"min_successful_responses,omitempty"`
 	Temperature                  *float64               `yaml:"temperature,omitempty" json:"temperature,omitempty"`
 	IncludeAnalysis              *bool                  `yaml:"include_analysis,omitempty" json:"include_analysis,omitempty"`
+	EnforceAnalysisJSON          *bool                  `yaml:"enforce_analysis_json,omitempty" json:"enforce_analysis_json,omitempty"`
 	OnError                      string                 `yaml:"on_error,omitempty" json:"on_error,omitempty"`
 	AnalysisTemplate             string                 `yaml:"analysis_template,omitempty" json:"analysis_template,omitempty"`
 	SynthesisTemplate            string                 `yaml:"synthesis_template,omitempty" json:"synthesis_template,omitempty"`
@@ -87,6 +88,7 @@ type FusionRequestConfig struct {
 	MinSuccessfulResponses       int                    `json:"min_successful_responses,omitempty" yaml:"min_successful_responses,omitempty"`
 	Temperature                  *float64               `json:"temperature,omitempty" yaml:"temperature,omitempty"`
 	IncludeAnalysis              *bool                  `json:"include_analysis,omitempty" yaml:"include_analysis,omitempty"`
+	EnforceAnalysisJSON          *bool                  `json:"enforce_analysis_json,omitempty" yaml:"enforce_analysis_json,omitempty"`
 	IncludeIntermediateResponses *bool                  `json:"include_intermediate_responses,omitempty" yaml:"include_intermediate_responses,omitempty"`
 	OnError                      string                 `json:"on_error,omitempty" yaml:"on_error,omitempty"`
 	AnalysisTemplate             string                 `json:"analysis_template,omitempty" yaml:"analysis_template,omitempty"`
