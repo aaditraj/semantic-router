@@ -117,6 +117,11 @@ type ModelResponse struct {
 	// HasToolCalls indicates the response contained tool_calls (not just content)
 	HasToolCalls bool
 
+	// ToolCalls are structured function-call proposals extracted from the
+	// assistant message. Fusion uses these as panel proposals; only the final
+	// judge's tool_calls are returned to the client.
+	ToolCalls []PanelToolCall
+
 	// IsStreaming indicates if this was a streaming response
 	IsStreaming bool
 
@@ -315,7 +320,8 @@ func (c *Client) parseNonStreamingResponse(body []byte, modelName string) (*Mode
 	// Extract content, tool_calls, and logprobs
 	if len(completion.Choices) > 0 {
 		result.Content = completion.Choices[0].Message.Content
-		if len(completion.Choices[0].Message.ToolCalls) > 0 || completion.Choices[0].Message.FunctionCall.Name != "" {
+		result.ToolCalls = panelToolCallsFromMessage(completion.Choices[0].Message)
+		if len(result.ToolCalls) > 0 {
 			result.HasToolCalls = true
 		}
 
@@ -341,6 +347,30 @@ func (c *Client) parseNonStreamingResponse(body []byte, modelName string) (*Mode
 	})
 
 	return result, nil
+}
+
+func panelToolCallsFromMessage(message openai.ChatCompletionMessage) []PanelToolCall {
+	calls := make([]PanelToolCall, 0, len(message.ToolCalls)+1)
+	for _, toolCall := range message.ToolCalls {
+		name := strings.TrimSpace(toolCall.Function.Name)
+		if name == "" {
+			continue
+		}
+		calls = append(calls, PanelToolCall{
+			Name:      name,
+			Arguments: toolCall.Function.Arguments,
+		})
+	}
+	if name := strings.TrimSpace(message.FunctionCall.Name); name != "" {
+		calls = append(calls, PanelToolCall{
+			Name:      name,
+			Arguments: message.FunctionCall.Arguments,
+		})
+	}
+	if len(calls) == 0 {
+		return nil
+	}
+	return calls
 }
 
 // parseStreamingResponse parses SSE streaming response

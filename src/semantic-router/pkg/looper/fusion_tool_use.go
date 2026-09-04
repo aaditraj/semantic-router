@@ -10,6 +10,10 @@ import (
 
 const fusionAnalysisStageInstruction = "You are the Fusion analysis judge. Output exactly one valid JSON object with only these keys: consensus, contradictions, partial_coverage, unique_insights, blind_spots. Do not call tools. Do not emit markdown, XML tags, or extra prose."
 
+// stripFusionToolUse removes tools from analysis/retry requests. Panel and
+// final stages keep tools so reasoning models can emit structured proposals;
+// only the final judge's tool_calls are returned to the client.
+
 func stripFusionToolUse(req *openai.ChatCompletionNewParams) *openai.ChatCompletionNewParams {
 	if req == nil {
 		return nil

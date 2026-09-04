@@ -397,6 +397,13 @@ func TestFusionLooperAllowsFinalJudgeToolCallsOnly(t *testing.T) {
 	require.Len(t, message["tool_calls"], 1)
 	assert.Equal(t, "tool_calls", choices[0].(map[string]interface{})["finish_reason"])
 	assert.Contains(t, body, "fusion")
+	fusionTrace := body["fusion"].(map[string]interface{})
+	panelResponses := fusionTrace["responses"].([]interface{})
+	require.Len(t, panelResponses, 2)
+	for _, raw := range panelResponses {
+		panel := raw.(map[string]interface{})
+		require.NotEmpty(t, panel["tool_calls"])
+	}
 
 	var usageBody struct {
 		Usage TokenUsage `json:"usage"`
@@ -485,13 +492,17 @@ func fusionToolCallObservationFromPayload(payload map[string]interface{}) fusion
 func writeFusionToolCallFixtureResponse(t *testing.T, w http.ResponseWriter, model string, prompt string) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
-	if model == "judge" && strings.Contains(prompt, "Final answer:") {
+	if model != "judge" {
+		_ = json.NewEncoder(w).Encode(fusionToolCallCompletion(model))
+		return
+	}
+	if strings.Contains(prompt, "Final answer:") {
 		_ = json.NewEncoder(w).Encode(fusionToolCallCompletion(model))
 		return
 	}
 
 	content := "panel answer"
-	if model == "judge" && strings.Contains(prompt, "return only valid JSON") {
+	if strings.Contains(prompt, "return only valid JSON") {
 		content = `{"consensus":["panel"],"contradictions":[],"partial_coverage":[],"unique_insights":[],"blind_spots":[]}`
 	}
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -544,18 +555,29 @@ func assertFusionToolCallObservations(t *testing.T, observations []fusionToolCal
 	t.Helper()
 	require.Len(t, observations, expected)
 	finalJudgeWithTools := false
+	panelWithTools := 0
 	for _, got := range observations {
 		assert.True(t, got.hasToolResult, "%s should preserve prior tool results", got.model)
 		if got.model == "judge" && strings.Contains(got.prompt, "Final answer:") {
 			assert.True(t, got.hasTools)
 			assert.Equal(t, "auto", got.toolChoice)
+			assert.Contains(t, got.prompt, "Proposed tool call: search")
+			assert.Contains(t, got.prompt, `Arguments JSON: {"query":"fusion"}`)
+			assert.Contains(t, got.prompt, "emit a standard tool_call")
 			finalJudgeWithTools = true
 			continue
 		}
-		assert.False(t, got.hasTools, "%s should not receive tools for prompt %q", got.model, got.prompt)
+		if got.model != "judge" {
+			assert.True(t, got.hasTools, "%s panel should receive tools so it can propose a call", got.model)
+			assert.Equal(t, "auto", got.toolChoice)
+			panelWithTools++
+			continue
+		}
+		assert.False(t, got.hasTools, "%s analysis should not receive tools for prompt %q", got.model, got.prompt)
 		assert.Empty(t, got.toolChoice)
 	}
 	assert.True(t, finalJudgeWithTools)
+	assert.Equal(t, 2, panelWithTools)
 }
 
 func TestFusionLooperAllPanelFailuresReturnError(t *testing.T) {
@@ -641,6 +663,34 @@ func TestNormalizePanelResponseForAnalysisPreservesPreambleBeforeToolCall(t *tes
 	assert.Contains(t, normalized, "Proposed tool call: read")
 	assert.Contains(t, normalized, `filePath="/testbed/astropy/tests/test_quantity.py"`)
 	assert.NotContains(t, normalized, "<tool_call>")
+}
+
+func TestFormatPanelResponsesIncludesStructuredToolCalls(t *testing.T) {
+	out := formatPanelResponses([]*ModelResponse{
+		{
+			Model: "ornith-9b",
+			ToolCalls: []PanelToolCall{
+				{Name: "bash", Arguments: `{"command":"ls /testbed"}`},
+			},
+		},
+	})
+
+	assert.Contains(t, out, "Proposed tool call: bash")
+	assert.Contains(t, out, `Arguments JSON: {"command":"ls /testbed"}`)
+}
+
+func TestFusionFinalPromptAsksJudgeToEmitPanelToolProposals(t *testing.T) {
+	prompt := buildFusionFinalPrompt(fusionExecutionConfig{}, "fix the bug", "", []*ModelResponse{
+		{
+			Model: "ornith-9b",
+			ToolCalls: []PanelToolCall{
+				{Name: "read", Arguments: `{"filePath":"/testbed/x.py"}`},
+			},
+		},
+	}, nil)
+
+	assert.Contains(t, prompt, "Proposed tool call: read")
+	assert.Contains(t, prompt, "emit a standard tool_call")
 }
 
 // The analysis stage must EXTEND the conversation, never rewrite it: rewriting

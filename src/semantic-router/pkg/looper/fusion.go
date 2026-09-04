@@ -62,10 +62,17 @@ type FusionAnalysis struct {
 	ParseFailed     bool     `json:"parse_failed,omitempty"`
 }
 
+// PanelToolCall is a structured tool proposal from a model response.
+type PanelToolCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments,omitempty"`
+}
+
 type FusionPanelResponse struct {
-	Model     string `json:"model"`
-	Content   string `json:"content"`
-	Reasoning string `json:"reasoning,omitempty"`
+	Model     string          `json:"model"`
+	Content   string          `json:"content"`
+	Reasoning string          `json:"reasoning,omitempty"`
+	ToolCalls []PanelToolCall `json:"tool_calls,omitempty"`
 }
 
 type FusionFailedModel struct {
@@ -194,7 +201,9 @@ func (l *FusionLooper) executeFusionPanel(
 				return
 			}
 			defer func() { <-sem }()
-			resp, err := l.callFusionModel(panelCtx, req, cfg, modelName, false, false, index+1, "panel", cfg.AnalysisOverrides[modelName])
+			// Panels keep tools so they can propose structured calls. Those
+			// proposals are text for the judge; only the final stage is returned.
+			resp, err := l.callFusionModel(panelCtx, req, cfg, modelName, true, false, index+1, "panel", cfg.AnalysisOverrides[modelName])
 			results <- fusionPanelResult{index: index, model: modelName, resp: resp, err: err}
 		}(i, model)
 	}
@@ -465,6 +474,7 @@ Rules:
 - Preserve the original output contract exactly.
 - Do not reveal hidden reasoning, scratch work, panel reasoning, tool traces, or internal deliberation.
 - Provide a concise explanation only when the original output contract asks for one.
+- If panel responses include proposed tool calls, emit a standard tool_call for the best proposal (or a compatible merge). Do not return an empty answer, and do not treat a proposal as already executed.
 
 Original prompt:
 %s
@@ -542,7 +552,7 @@ func formatPanelResponses(responses []*ModelResponse) string {
 		if resp == nil {
 			continue
 		}
-		fmt.Fprintf(&b, "Response %d (%s):\n%s\n\n", i+1, resp.Model, sanitizePanelContentForPrompt(resp.Content))
+		fmt.Fprintf(&b, "Response %d (%s):\n%s\n\n", i+1, resp.Model, formatPanelVisibleOutput(resp, false))
 		if reasoning := strings.TrimSpace(stripUnterminatedToolCall(resp.ReasoningContent)); reasoning != "" {
 			fmt.Fprintf(&b, "Reasoning %d (%s):\n%s\n\n", i+1, resp.Model, reasoning)
 		}
@@ -556,12 +566,46 @@ func formatPanelResponsesForAnalysis(responses []*ModelResponse) string {
 		if resp == nil {
 			continue
 		}
-		fmt.Fprintf(&b, "Response %d (%s):\n%s\n\n", i+1, resp.Model, normalizePanelResponseForAnalysis(resp.Content))
+		fmt.Fprintf(&b, "Response %d (%s):\n%s\n\n", i+1, resp.Model, formatPanelVisibleOutput(resp, true))
 		if reasoning := normalizePanelResponseForAnalysis(resp.ReasoningContent); reasoning != "" {
 			fmt.Fprintf(&b, "Reasoning %d (%s):\n%s\n\n", i+1, resp.Model, reasoning)
 		}
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func formatPanelVisibleOutput(resp *ModelResponse, forAnalysis bool) string {
+	content := sanitizePanelContentForPrompt(resp.Content)
+	if forAnalysis {
+		content = normalizePanelResponseForAnalysis(resp.Content)
+	}
+	parts := make([]string, 0, 2)
+	if content != "" {
+		parts = append(parts, content)
+	}
+	if proposals := formatPanelToolProposals(resp.ToolCalls); proposals != "" {
+		parts = append(parts, proposals)
+	}
+	return strings.Join(parts, "\n")
+}
+
+func formatPanelToolProposals(toolCalls []PanelToolCall) string {
+	if len(toolCalls) == 0 {
+		return ""
+	}
+	steps := make([]string, 0, len(toolCalls))
+	for _, toolCall := range toolCalls {
+		name := strings.TrimSpace(toolCall.Name)
+		if name == "" {
+			continue
+		}
+		step := fmt.Sprintf("Proposed tool call: %s", name)
+		if args := strings.TrimSpace(toolCall.Arguments); args != "" {
+			step += "\nArguments JSON: " + args
+		}
+		steps = append(steps, step)
+	}
+	return strings.Join(steps, "\n")
 }
 
 func normalizePanelResponseForAnalysis(content string) string {
@@ -827,6 +871,7 @@ func buildFusionTrace(
 				Model:     resp.Model,
 				Content:   resp.Content,
 				Reasoning: resp.ReasoningContent,
+				ToolCalls: resp.ToolCalls,
 			})
 		}
 	}
